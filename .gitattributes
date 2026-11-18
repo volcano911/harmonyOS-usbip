@@ -1,0 +1,7 @@
+# 校验文件必须保持 LF：CI 在 Linux 上用 sha256sum -c 校验，
+# 行尾混进 CR 会让文件名带上 \r 而找不到文件。
+release/SHA256SUMS.txt eol=lf
+
+# 构建产物不做文本换行转换
+*.hap binary
+*.so  binary

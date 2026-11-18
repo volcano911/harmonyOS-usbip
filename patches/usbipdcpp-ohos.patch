@@ -1,0 +1,71 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 76fb5f4..ca20d5e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -199,12 +199,20 @@ if (USBIPDCPP_BUILD_VIRTUAL_DEVICE)
+ endif ()
+ 
+ if (USBIPDCPP_BUILD_LIBUSB_COMPONENTS)
+-    find_package(PkgConfig REQUIRED)
+-    pkg_check_modules(libusb REQUIRED IMPORTED_TARGET libusb-1.0)
++    # [OHOS 移植补丁] 上层工程若已提供 libusb-1.0 目标（例如手写 CMake 交叉编译
++    # libusb 源码），直接用；否则维持上游行为走 pkg-config。Windows 主机上
++    # 没有 pkg-config 可执行文件，交叉编译 OHOS 时只能走前者。
++    if (TARGET libusb-1.0)
++        set(USBIPDCPP_LIBUSB_DEP libusb-1.0)
++    else ()
++        find_package(PkgConfig REQUIRED)
++        pkg_check_modules(libusb REQUIRED IMPORTED_TARGET libusb-1.0)
++        set(USBIPDCPP_LIBUSB_DEP PkgConfig::libusb)
++    endif ()
+ 
+     add_library(${PROJECT_NAME}_libusb ${LIB_TYPE} ${LIBUSB_SRC_FILES})
+     set_target_properties(${PROJECT_NAME}_libusb PROPERTIES EXPORT_NAME libusb)
+-    target_link_libraries(${PROJECT_NAME}_libusb PUBLIC PkgConfig::libusb)
++    target_link_libraries(${PROJECT_NAME}_libusb PUBLIC ${USBIPDCPP_LIBUSB_DEP})
+     target_link_libraries(${PROJECT_NAME}_libusb PUBLIC ${PROJECT_NAME})
+ endif ()
+ 
+diff --git a/include/usbipdcpp/Server.h b/include/usbipdcpp/Server.h
+index 44564a4..c13bd95 100644
+--- a/include/usbipdcpp/Server.h
++++ b/include/usbipdcpp/Server.h
+@@ -38,9 +38,12 @@ enum class ThreadPurpose {
+  */
+ struct ServerNetworkConfig {
+     /// socket 接收缓冲区大小（字节），0 表示使用系统默认值
+-    std::size_t socket_recv_buffer_size = 128 * 1024;
++    /// 注意：显式设置会关掉内核的 TCP 自动调优，吞吐上限约等于“缓冲/RTT”。
++    /// 原默认 128KB 在 WiFi 上（RTT 10~20ms）只能跑到 6~12MB/s，是实测瓶颈之一；
++    /// 实际生效值仍受内核 net.core.rmem_max 限制（Linux 常见 208KB），无害。
++    std::size_t socket_recv_buffer_size = 1024 * 1024;
+     /// socket 发送缓冲区大小（字节），0 表示使用系统默认值
+-    std::size_t socket_send_buffer_size = 128 * 1024;
++    std::size_t socket_send_buffer_size = 1024 * 1024;
+     /// 是否禁用 Nagle 算法（减少小包延迟）
+     bool tcp_no_delay = true;
+ };
+diff --git a/src/LibusbHandler/LibusbServer.cpp b/src/LibusbHandler/LibusbServer.cpp
+index fed7c8a..8430214 100644
+--- a/src/LibusbHandler/LibusbServer.cpp
++++ b/src/LibusbHandler/LibusbServer.cpp
+@@ -55,9 +55,16 @@ std::vector<UsbInterface> build_usb_interfaces(const libusb_config_descriptor *c
+             std::vector<UsbEndpoint> alt_endpoints;
+             alt_endpoints.reserve(intf_desc.bNumEndpoints);
+             for (auto ep_i = 0; ep_i < intf_desc.bNumEndpoints; ep_i++) {
+-                alt_endpoints.emplace_back(intf_desc.endpoint[ep_i].bEndpointAddress,
+-                                           intf_desc.endpoint[ep_i].bmAttributes & 0x03,
+-                                           intf_desc.endpoint[ep_i].wMaxPacketSize, intf_desc.endpoint[ep_i].bInterval);
++                // [OHOS 移植补丁] 原写法 emplace_back(4 个参数) 依赖 C++20 的
++                // 「括号聚合初始化」(P0960)，该特性 clang16 才实现，OHOS SDK 的
++                // clang15 会报 "no matching constructor"。改成显式聚合 + push_back，
++                // 语义完全等价。bmAttributes & 0x03 是 int，进 uint8_t 字段需显式收窄，
++                // 否则花括号初始化会触发 narrowing 错误。
++                alt_endpoints.push_back(UsbEndpoint{
++                        intf_desc.endpoint[ep_i].bEndpointAddress,
++                        static_cast<std::uint8_t>(intf_desc.endpoint[ep_i].bmAttributes & 0x03),
++                        intf_desc.endpoint[ep_i].wMaxPacketSize,
++                        intf_desc.endpoint[ep_i].bInterval});
+             }
+             endpoints.push_back(std::move(alt_endpoints));
+         }

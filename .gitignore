@@ -1,0 +1,60 @@
+# HarmonyOS build
+build/
+.hvigor/
+.idea/
+.gradle/
+local.properties
+*.iml
+
+# OHOS signing (contains private keys). NOTE: build-profile.json5 itself is
+# committed on purpose - it holds the module/product layout, not any key
+# material. Signing configs live in a separate file that is ignored below.
+*.cer
+*.p7b
+*.p12
+*.pfx
+*.pem
+*.key
+*.csr
+*.prof
+*.profile
+*.provision
+signingConfigs.json
+
+# Build and signed application artifacts
+dist/
+*.hap
+*.hsp
+*.app
+
+# Exception: the unsigned release packages are published on purpose so that
+# people without a HarmonyOS toolchain can grab a build and sign it locally.
+!release/*.hap
+
+# Node
+node_modules/
+oh_modules/
+entry/oh_modules/
+
+# HarmonyOS previewer / analyser caches
+.idea/
+.preview/
+entry/.preview/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# Temp
+*.log
+/tmp/
+nul
+entry/.cxx/
+
+# Third-party sources (clone separately, point DEPS_ROOT at them)
+deps/

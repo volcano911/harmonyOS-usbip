@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "USB/IP 共享服务"
+    },
+    {
+      "name": "app_name",
+      "value": "USB/IP 共享"
+    },
+    {
+      "name": "permission_background_reason",
+      "value": "保持 USB/IP 服务在后台运行，避免锁屏后远程电脑断开"
+    }
+  ]
+}

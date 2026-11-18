@@ -1,0 +1,7 @@
+{
+  "modelVersion": "6.1.0",
+  "name": "harmonyos-usbip",
+  "version": "1.0.0",
+  "description": "USB/IP server for HarmonyOS - share USB devices over the network",
+  "dependencies": {}
+}

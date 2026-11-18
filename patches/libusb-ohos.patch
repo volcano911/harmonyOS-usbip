@@ -1,0 +1,23 @@
+diff --git a/libusb/os/linux_usbfs.c b/libusb/os/linux_usbfs.c
+index 74e73f9..3b7c01e 100644
+--- a/libusb/os/linux_usbfs.c
++++ b/libusb/os/linux_usbfs.c
+@@ -317,8 +317,16 @@ static int get_kernel_version(struct libusb_context *ctx,
+ 
+ 	atoms = sscanf(uts.release, "%d.%d.%d", &ver->major, &ver->minor, &ver->sublevel);
+ 	if (atoms < 2) {
+-		usbi_err(ctx, "failed to parse uname release '%s'", uts.release);
+-		return -1;
++		/* OHOS/HarmonyOS reports e.g. "HongMeng Kernel 1.13.0". The numbers in
++		 * there are the HarmonyOS kernel version, not a Linux version, so do
++		 * NOT try to salvage them (1.13.0 would fail the >= 2.6.32 check).
++		 * Anything able to run this usbfs backend is far past that, so assume a
++		 * modern baseline and carry on instead of failing libusb_init. */
++		usbi_warn(ctx, "unrecognized kernel release '%s', assuming 6.1.0", uts.release);
++		ver->major = 6;
++		ver->minor = 1;
++		ver->sublevel = 0;
++		return 0;
+ 	}
+ 
+ 	if (atoms < 3)

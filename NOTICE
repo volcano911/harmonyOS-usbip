@@ -1,0 +1,51 @@
+Upstream attribution
+====================
+
+This project is a HarmonyOS (OpenHarmony) port of an existing Android
+application and is built on a third-party USB/IP server library. Neither the
+USB/IP protocol implementation nor the USB device handling originates here.
+
+Upstream application
+--------------------
+
+  yunsmall/Android-Usbipdcpp
+  https://github.com/yunsmall/Android-Usbipdcpp
+
+  An Android USB/IP server app, licensed GPL-3.0. This HarmonyOS port follows
+  its architecture, its user-facing feature set (start server / bind device /
+  live log viewer) and its Node-API bridge layout. The original Android
+  implementation remains the work of its author and contributors.
+
+USB/IP server library
+---------------------
+
+  usbipdcpp
+  https://github.com/yunsmall/usbipdcpp
+  Licensed under LGPLv3.
+
+  This product uses usbipdcpp (https://github.com/yunsmall/usbipdcpp),
+  licensed under LGPLv3.
+
+  usbipdcpp is statically linked into libusbip_napi.so. In accordance with
+  LGPLv3 section 4, the complete corresponding source of this application is
+  published in this repository, and every change applied to usbipdcpp is kept
+  in patches/usbipdcpp-ohos.patch so that the library can be rebuilt and
+  relinked against a modified version.
+
+Other third-party components
+----------------------------
+
+  libusb 1.0.30         LGPL-2.1   https://github.com/libusb/libusb
+  Asio                  BSL-1.0    https://github.com/chriskohlhoff/asio
+  spdlog (bundled fmt)  MIT        https://github.com/gabime/spdlog
+
+The HarmonyOS module skeleton (build scripts, hvigor files, ContinuousTask
+scaffolding) was started from an application template and has been rewritten
+for this project.
+
+License
+-------
+
+This project as a whole is distributed under the GNU General Public License
+version 3. See LICENSE for the full text. Because it derives from a GPL-3.0
+application, GPL-3.0 is the license under which it must be redistributed.

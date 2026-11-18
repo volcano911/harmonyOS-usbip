@@ -1,0 +1,1 @@
+6c2469739990a5e3d38c412d049d419b77c3aa41f45e823856236d29bd7374af *harmonyos-usbip-1.0.0-arm64-unsigned.hap
