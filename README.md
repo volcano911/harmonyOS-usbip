@@ -63,7 +63,9 @@ USB/IP 协议允许把一台机器上的 USB 设备通过网络「导出」，�
 
 ## 安装
 
-仓库 `release/` 下提供的是 **未签名** HAP，零售设备无法直接安装。二选一：
+到 [Releases](../../releases/latest) 下载 `harmonyos-usbip-*-arm64-unsigned.hap`，同页附件里还有 `SHA256SUMS.txt` 可核对校验值。仓库 `release/` 目录保留了同一份文件，方便 clone 后直接取用。
+
+下载到的是 **未签名** HAP，零售设备装不上，二选一：
 
 **A. DevEco Studio 自动签名**
 
@@ -84,7 +86,11 @@ java -jar hap-sign-tool.jar sign-app \
 hdc install signed.hap
 ```
 
-安装后请核对 `release/SHA256SUMS.txt` 中的校验值。
+签名前先核对下载到的包：
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
 
 ## 使用
 
