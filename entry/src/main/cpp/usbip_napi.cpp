@@ -324,7 +324,7 @@ std::string ReadString(napi_env env, napi_value v) {
     if (napi_get_value_string_utf8(env, v, nullptr, 0, &len) != napi_ok || len == 0) {
         return {};
     }
-    std::string out(len, '\0');
+    std::string out(len + 1, '\0');
     size_t copied = 0;
     if (napi_get_value_string_utf8(env, v, out.data(), len + 1, &copied) != napi_ok) {
         return {};

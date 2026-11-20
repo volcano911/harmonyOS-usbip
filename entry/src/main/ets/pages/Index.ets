@@ -89,6 +89,15 @@ struct Index {
   private orphanRounds: Map<string, number> = new Map();
   /** name → 上次开关动作的时间戳；600ms 内不接受第二次操作，见 setShared */
   private lastActionAt: Map<string, number> = new Map();
+  /**
+   * 设备身份 → 绑定成功时 native 返回的真实 busid。
+   *
+   * 界面判断"是否已共享"必须用这个地面真相，不能再靠推导：界面算出来的值
+   * 和 native 实际用的值只要差一个字符，开关就会在下一帧自动弹回去。
+   */
+  private boundByIdentity: Map<string, string> = new Map();
+  /** stableBusid 的异常只报一次，避免刷屏 */
+  private stableWarned: boolean = false;
 
   aboutToAppear(): void {
     const ok: boolean = usbipNative.init();
@@ -282,9 +291,18 @@ struct Index {
    */
   private stableBusidOf(d: SharedDevice): string {
     try {
-      return usbipNative.stableBusid(d.busNum, d.vendorId, d.productId, d.serial, d.product);
+      const s: string = usbipNative.stableBusid(d.busNum, d.vendorId, d.productId, d.serial, d.product);
+      if (s.length === 0 && !this.stableWarned) {
+        this.stableWarned = true;
+        this.appendLog('[绑定] 警告：native 未返回稳定 busid，回退到临时地址匹配（拔插后开关可能弹回）', LOG_WARN);
+      }
+      return s;
     } catch (e) {
-      hilog.error(DOMAIN, TAG, 'stableBusid failed: %{public}s', JSON.stringify(e));
+      if (!this.stableWarned) {
+        this.stableWarned = true;
+        hilog.error(DOMAIN, TAG, 'stableBusid failed: %{public}s', JSON.stringify(e));
+        this.appendLog(`[绑定] 警告：stableBusid 调用异常 ${JSON.stringify(e)}`, LOG_WARN);
+      }
       return '';
     }
   }
@@ -294,7 +312,16 @@ struct Index {
       return '';
     }
     const parts: string[] = bound.split('|');
-    // 稳定 busid 优先：现在所有绑定都用它
+    // 第一优先：绑定成功时 native 亲口告诉我们的 busid。
+    //
+    // 这是"地面真相"，不依赖任何推导/哈希。以前开关会自己弹回去，就是因为
+    // 界面这边算出来的 busid 和 native 实际用的是两个值，匹配失败 → shared=false
+    // → 2 秒后开关自动关掉（看起来像"点一下就退出"）。
+    const cached: string = this.boundByIdentity.get(device.identity()) ?? '';
+    if (cached.length > 0 && parts.indexOf(cached) >= 0) {
+      return cached;
+    }
+    // 第二优先：按设备身份推导的稳定 busid
     const stable: string = this.stableBusidOf(device);
     if (stable.length > 0) {
       const hit: string = this.matchBusid(stable, parts);
@@ -302,6 +329,7 @@ struct Index {
         return hit;
       }
     }
+    // 最后才是旧的临时地址推导（兼容上一版导出的记录）
     const cands: string[] = device.busidCandidates();
     for (let c = 0; c < cands.length; c++) {
       const hit: string = this.matchBusid(cands[c], parts);
@@ -602,6 +630,12 @@ struct Index {
   private refreshDevices(): void {
     const list: SharedDevice[] = this.service.list();
     const bound: string = this.boundBusids();
+    // 清掉已经不在导出列表里的缓存项（拔插、清理幽灵记录之后）
+    this.boundByIdentity.forEach((v: string, k: string) => {
+      if (bound.indexOf(v) < 0) {
+        this.boundByIdentity.delete(k);
+      }
+    });
     for (let i = 0; i < list.length; i++) {
       const busid: string = this.busidOf(list[i], bound);
       list[i].busid = busid;
@@ -749,7 +783,15 @@ struct Index {
       device.shared = true;
       device.fd = fd;
       device.busid = usbipNative.getLastBusid();
+      // 记下地面真相：开关状态以后就按它来匹配，不再依赖任何推导
+      this.boundByIdentity.set(device.identity(), device.busid);
       this.appendLog(`[绑定] ${device.name} → busid=${device.busid}`, LOG_OK);
+      // 自检：刚绑上就查一遍服务端导出列表，对不上说明界面和 native 的
+      // busid 口径已经分叉了 —— 这种问题不报出来，表现就是"开关自己弹回去"
+      const nowBound: string[] = this.boundBusids().split('|');
+      if (nowBound.indexOf(device.busid) < 0) {
+        this.appendLog(`[绑定] 自检失败：服务端导出列表里没有 ${device.busid}（现有 ${this.boundBusids()}）`, LOG_ERROR);
+      }
       this.devices = this.devices.slice();
       this.logState('绑定后');
       return true;
@@ -799,6 +841,9 @@ struct Index {
 
     this.appendLog(code === 0 ? `[解绑] ${device.name} busid=${busid} 已提交`
       : `[解绑] ${device.name} 失败 code=${code}`, code === 0 ? LOG_OK : LOG_ERROR);
+    if (code === 0) {
+      this.boundByIdentity.delete(device.identity());
+    }
     this.service.closeDevice(device.name);
     device.shared = false;
     device.fd = -1;
