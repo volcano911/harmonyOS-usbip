@@ -52,10 +52,15 @@ $Hvigor = Join-Path $Tools 'bin\hvigorw.bat'
 # which makes us debug code that is not even running. The UI prints
 # "v<versionName> (code <versionCode>)" at startup, so a mismatch is visible.
 $AppJson = Join-Path $Project 'AppScope\app.json5'
+$RelVersion = '1.0.0'
 if (Test-Path $AppJson) {
     $stamp = Get-Date
     $vcode = 1000000 + [int]$stamp.ToString('MMddHHmm')
     $vname = '1.0.' + $stamp.ToString('MMdd.HHmm')
+    # For a published release, pin a readable version: BUILD_VERSION=1.0.1
+    # (the tag pushed to GitHub must equal versionName, see release.yml)
+    if ($env:BUILD_VERSION) { $vname = $env:BUILD_VERSION }
+    $RelVersion = $vname
     $text = [System.IO.File]::ReadAllText($AppJson)
     $text = [regex]::Replace($text, '"versionCode"\s*:\s*\d+', ('"versionCode": ' + $vcode))
     $text = [regex]::Replace($text, '"versionName"\s*:\s*"[^"]*"', ('"versionName": "' + $vname + '"'))
@@ -94,7 +99,7 @@ if (-not (Test-Path $Hap)) {
 
 $DistDir = Join-Path $Root 'out'
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-$Out = Join-Path $DistDir "usbip-1.0.0-api23-arm64-$Mode-unsigned.hap"
+$Out = Join-Path $DistDir "usbip-$RelVersion-api23-arm64-$Mode-unsigned.hap"
 Copy-Item $Hap $Out -Force
 
 $SizeMB = [math]::Round((Get-Item $Out).Length / 1MB, 2)

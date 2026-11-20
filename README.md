@@ -170,7 +170,17 @@ $env:DEPS_ROOT = 'D:\usbip-deps'
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-产物：`out/usbip-1.0.0-api23-arm64-debug-unsigned.hap`
+产物：`out/usbip-<versionName>-api23-arm64-debug-unsigned.hap`
+
+发布版请显式指定版本号（tag 必须与 `versionName` 一致，见 `.github/workflows/release.yml`）：
+
+```powershell
+$env:BUILD_VERSION = '1.0.1'
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+不指定时每次构建自动生成 `1.0.MMdd.HHmm` 形式的开发版号，并把 `versionCode`
+设为 `1000000 + 月日时分` —— 版本号不变会被系统的覆盖安装挡掉。
 
 `build.ps1` 里 `$Root`、`$JavaHome` 是按作者本机写的，换机器要改这两处。
 **这个文件必须保持纯 ASCII** —— Windows PowerShell 5.1 对无 BOM 的 `.ps1`
@@ -231,6 +241,10 @@ usbManager.getFileDescriptor()                     usbipdcpp::LibusbServer
 
 ## 疑难排查：PC 反复请求一个不存在的 busid
 
+> 本节描述的现象在 **v1.0.1 已从两端消除**（busid 不再随拔插变化，服务端也不再
+> 因为陌生 busid 顶掉现有会话）。保留下来是为了理解旧版本行为，或在用其他
+> 服务端实现时对照。
+
 **症状**：手机上服务正常导出设备（比如 `1-2:0`），PC 明明已经连上，
 过一会儿连接被顶掉，日志里出现类似
 
@@ -281,6 +295,27 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\usbip2_ude\Parameters" /v Reatta
 ```
 
 同目录下还有 `ReattachFirstDelay`（首次延迟，秒）和 `ReattachMaxDelay`（最大延迟，秒）。
+
+## 更新记录
+
+### v1.0.1 — 连接稳定性
+
+这一版解决的是「看着连上了，实际什么都没发生」这一类问题，根因有四个，都在自己这边：
+
+| 问题 | 现象 | 改动 |
+|---|---|---|
+| **busid 用设备地址当身份** | 同一个设备拔插后编号从 `1-2` 跳到 `1-3`，PC 缓存的旧值永远失效 | 改用 `VID:PID:序列号` 的 FNV-1a 指纹，同一个设备永远同一个 busid |
+| **陌生 busid 的请求会顶掉正在用的会话** | PC 后台重试一次，正常连接就断一次，无限循环 | 请求对不上任何导出记录时只回错误，绝不触碰现有会话 |
+| **孤儿判定按临时地址比** | 刚绑定成功 300ms 就被自己摘掉，开关弹回、连不上 | 改用设备身份认领；刚绑定 6 秒内不参与判定 |
+| **绑定后立刻解绑** | 点一次开关，日志里 `[绑定]` 后同一毫秒出现 `[解绑]` | 开关改成单一 `onClick` 入口，状态只认服务端导出列表 |
+
+另外：每次构建自动递增 `versionCode`（同版本号覆盖安装会被系统挡掉，导致"改了没生效"），
+界面上会显示版本号，日志首行也会打印，便于确认装的是哪一版。
+
+### v1.0.0 — 首个版本
+
+鸿蒙原生实现：`usbManager` 授权拿 fd → `libusb_wrap_sys_device` → 导出到 TCP 3240，
+PC 端用任何标准 USB/IP 客户端即可 attach。
 
 ## 致谢
 
