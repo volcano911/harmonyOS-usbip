@@ -207,6 +207,25 @@ index d883b5b..7d00c82 100644
      //是否在传输ret_submit的阶段
      std::atomic_bool cmd_transferring = false;
  
+diff --git a/src/LibusbHandler/LibusbDeviceHandler.cpp b/src/LibusbHandler/LibusbDeviceHandler.cpp
+index 5d586cc..2ddf1a0 100644
+--- a/src/LibusbHandler/LibusbDeviceHandler.cpp
++++ b/src/LibusbHandler/LibusbDeviceHandler.cpp
+@@ -735,8 +735,12 @@ void LIBUSB_CALL usbipdcpp::LibusbDeviceHandler::transfer_callback(libusb_transf
+             }
+             break;
+         case LIBUSB_TRANSFER_CANCELLED:
+-            SPDLOG_INFO("dev {}: unlinked by a call to usb_unlink_urb()",
+-                        get_trx_device_busid(trx));
++            // [OHOS 移植补丁] 降为 debug：客户端（尤其 Windows 的 HID 驱动）
++            // 会周期性地取消尚未完成的 interrupt IN 再重投，一条设备连着时
++            // 每秒能刷好几条，把真正有用的日志全顶掉。取消次数在会话结束时
++            // 由「本会话 URB 统计: 提交 X 条, 被客户端取消 Y 条」汇总。
++            SPDLOG_DEBUG("dev {}: unlinked by a call to usb_unlink_urb()",
++                         get_trx_device_busid(trx));
+             break;
+         case LIBUSB_TRANSFER_STALL:
+             SPDLOG_ERROR("dev {}: endpoint {} is stalled",
 diff --git a/src/LibusbHandler/LibusbServer.cpp b/src/LibusbHandler/LibusbServer.cpp
 index fed7c8a..c403629 100644
 --- a/src/LibusbHandler/LibusbServer.cpp

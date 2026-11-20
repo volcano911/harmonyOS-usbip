@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.zhoucan.usbip",
     "vendor": "zhoucan",
-    "versionCode": 12201732,
-    "versionName": "1.0.1120.1732",
+    "versionCode": 12201741,
+    "versionName": "1.0.1120.1741",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }
