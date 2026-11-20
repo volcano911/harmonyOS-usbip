@@ -272,6 +272,16 @@ reg query "HKLM\SYSTEM\CurrentControlSet\Services\usbip2_ude\PersistentState"
 
 删掉之后，只有你手动执行 `usbip attach -r <手机IP> -b <当前busid>` 才会发起连接。
 
+如果还想连"后台自动重试"都关掉（默认会重试 20 次，首次延迟 30 秒、最长 8 分钟一次），
+改驱动参数即可，不需要改代码：
+
+```cmd
+:: 0 = 不再重试；想保留一次机会就写 1
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\usbip2_ude\Parameters" /v ReattachMaxAttempts /t REG_DWORD /d 0 /f
+```
+
+同目录下还有 `ReattachFirstDelay`（首次延迟，秒）和 `ReattachMaxDelay`（最大延迟，秒）。
+
 ## 致谢
 
 本项目几乎所有的 USB/IP 工作都来自上游，详见 [NOTICE](NOTICE)：
