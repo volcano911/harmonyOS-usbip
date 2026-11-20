@@ -311,6 +311,60 @@ std::string SafeString(const char *s) {
     return s == nullptr ? std::string() : std::string(s);
 }
 
+/** 读一个 JS 字符串参数；不是字符串或为 undefined 时返回空串 */
+std::string ReadString(napi_env env, napi_value v) {
+    if (v == nullptr) {
+        return {};
+    }
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, v, &type) != napi_ok || type != napi_string) {
+        return {};
+    }
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, v, nullptr, 0, &len) != napi_ok || len == 0) {
+        return {};
+    }
+    std::string out(len, '\0');
+    size_t copied = 0;
+    if (napi_get_value_string_utf8(env, v, out.data(), len + 1, &copied) != napi_ok) {
+        return {};
+    }
+    out.resize(copied);
+    return out;
+}
+
+/**
+ * 由设备身份推导稳定 busid：`<总线>-<指纹>`。
+ *
+ * 为什么不用 libusb 的 `总线-设备地址:端口`：设备地址是主控在每次枚举时临时
+ * 分配的（USB 2.0 规范 9.1.4，地址只在本次"会话"内有效），拔插、授权重开、
+ * 系统重启 USB 栈都会拿到不同的号。它是"座位号"，不是"身份证"。
+ *
+ * 身份证是 VID:PID[:序列号]。这里把它哈希成一个 5 位以内的数字，拼成 busid。
+ * 同一个设备永远得到同一个值，PC 端缓存的 busid 就永远有效。
+ */
+std::string MakeStableBusid(int32_t busNum, int32_t vid, int32_t pid,
+                            const std::string &serial, const std::string &product) {
+    // FNV-1a 32bit：实现简单、分布均匀，跨版本稳定（不要换算法，会改变所有 busid）
+    char key[256] = {};
+    if (serial.empty()) {
+        snprintf(key, sizeof(key), "%04x:%04x:p:%s", vid, pid, product.c_str());
+    } else {
+        snprintf(key, sizeof(key), "%04x:%04x:s:%s", vid, pid, serial.c_str());
+    }
+    std::uint32_t h = 2166136261u;
+    for (const char *p = key; *p != '\0'; ++p) {
+        h ^= static_cast<unsigned char>(*p);
+        h *= 16777619u;
+    }
+    // 取 2..65535：碰撞概率对"一两台设备"可忽略，又能落进一个像端口号的区间
+    const std::uint32_t idx = 2u + (h % 65534u);
+    const int bus = busNum > 0 ? busNum : 1;
+    char out[32] = {};
+    snprintf(out, sizeof(out), "%d-%u", bus, idx);
+    return std::string(out);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- 导出函数
@@ -395,16 +449,35 @@ napi_value InitNative(napi_env env, napi_callback_info /*info*/) {
     }
 }
 
-/** bindDevice(fd) —— 用 fd 绑定设备，成功返回 0；busid 用 getLastBusid() 取 */
+/** stableBusid(busNum, vid, pid, serial, product) —— 与 bindDevice 用的完全同一套算法 */
+napi_value StableBusid(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value args[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t bus_num = 1;
+    int32_t vid = 0;
+    int32_t pid = 0;
+    ReadInt(env, argc > 0 ? args[0] : nullptr, &bus_num);
+    ReadInt(env, argc > 1 ? args[1] : nullptr, &vid);
+    ReadInt(env, argc > 2 ? args[2] : nullptr, &pid);
+    const std::string serial = ReadString(env, argc > 3 ? args[3] : nullptr);
+    const std::string product = ReadString(env, argc > 4 ? args[4] : nullptr);
+    return MakeString(env, MakeStableBusid(bus_num, vid, pid, serial, product));
+}
+
+/** bindDevice(fd, busid?) —— 用 fd 绑定设备，成功返回 0；busid 用 getLastBusid() 取 */
 napi_value BindDevice(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1] = {nullptr};
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
 
     int32_t fd = -1;
     if (!ReadInt(env, argc > 0 ? args[0] : nullptr, &fd) || fd < 0) {
         return MakeInt(env, ErrorCode::UNKNOWN_ERROR);
     }
+    // [OHOS 移植补丁] 第二个参数是 ArkTS 侧算好的稳定 busid（见 MakeStableBusid）。
+    // 没传就退回 libusb 拓扑推导，保持对其它平台/调用点的兼容。
+    const std::string busid_override = ReadString(env, argc > 1 ? args[1] : nullptr);
 
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -417,7 +490,7 @@ napi_value BindDevice(napi_env env, napi_callback_info info) {
         spdlog::info("绑定设备 fd={}", fd);
 
         // 先取 busid 再绑定：取不到就直接返回，不留"绑上了却报不出 busid"的半成品
-        std::string busid;
+        std::string busid = busid_override;
         int dev_addr = -1;
         {
             libusb_device_handle *tmp = nullptr;
@@ -428,7 +501,9 @@ napi_value BindDevice(napi_env env, napi_callback_info info) {
             }
             libusb_device *dev = libusb_get_device(tmp);
             if (dev != nullptr) {
-                busid = usbipdcpp::get_device_busid(dev);
+                if (busid.empty()) {
+                    busid = usbipdcpp::get_device_busid(dev);
+                }
                 dev_addr = libusb_get_device_address(dev);
             }
             libusb_close(tmp);
@@ -437,9 +512,10 @@ napi_value BindDevice(napi_env env, napi_callback_info info) {
             spdlog::error("取 busid 失败 fd={}", fd);
             return MakeInt(env, ErrorCode::DEVICE_NOT_FOUND);
         }
-        spdlog::info("请求绑定 fd={} busid={} addr={}", fd, busid, dev_addr);
+        spdlog::info("请求绑定 fd={} busid={} addr={}{}", fd, busid, dev_addr,
+                     busid_override.empty() ? "" : "(稳定busid)");
 
-        auto result = g_server->bind_host_device_with_wrapped_fd(static_cast<intptr_t>(fd));
+        auto result = g_server->bind_host_device_with_wrapped_fd(static_cast<intptr_t>(fd), busid);
         int code = ToErrorCode(result);
 
         // 幂等化：同一个 busid 上如果还挂着上一次导出的记录，服务端会拒绝
@@ -458,7 +534,7 @@ napi_value BindDevice(napi_env env, napi_callback_info info) {
             g_server->notify_device_removed(busid);
             for (int i = 0; i < 24; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
-                code = ToErrorCode(g_server->bind_host_device_with_wrapped_fd(static_cast<intptr_t>(fd)));
+                code = ToErrorCode(g_server->bind_host_device_with_wrapped_fd(static_cast<intptr_t>(fd), busid));
                 if (code == ErrorCode::SUCCESS) {
                     spdlog::info("清除残留后重试绑定成功 busid={} (第{}次)", busid, i + 1);
                     break;
@@ -927,6 +1003,7 @@ napi_value Init(napi_env env, napi_value exports) {
             {"init", nullptr, InitNative, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"probeFd", nullptr, ProbeFd, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"bindDevice", nullptr, BindDevice, nullptr, nullptr, nullptr, napi_default, nullptr},
+            {"stableBusid", nullptr, StableBusid, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"unbindDevice", nullptr, UnbindDevice, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"notifyDeviceRemoved", nullptr, NotifyDeviceRemoved, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"getLastBusid", nullptr, GetLastBusid, nullptr, nullptr, nullptr, napi_default, nullptr},

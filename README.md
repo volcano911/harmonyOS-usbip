@@ -207,6 +207,10 @@ usbManager.getFileDescriptor()                     usbipdcpp::LibusbServer
   没有这个符号）。改成映射到 spdlog 自带的 fmt。
 - **后台保活用 `dataTransfer` 模式**，不是 `TASK_KEEPING`。后者要求系统应用，
   三方调用 `startBackgroundRunning` 直接返回 202。
+- **busid 用设备身份推导，不用设备地址**。鸿蒙拿不到 sysfs 拓扑，libusb 只能给出
+  `总线-设备地址:端口`，而设备地址是主控在每次枚举时临时分配的（USB 2.0 规范 9.1.4），
+  拔插、授权重开都会变。现在改成对 `VID:PID:序列号` 做 FNV-1a 哈希，得到
+  `总线-指纹`（例如 `1-41207`），同一个设备永远同一个 busid，PC 端缓存不会失效。
 - **状态判断以服务端为准**。界面上的「是否已共享」不是 ArkTS 自己记账，而是每次
   向 native 查一遍 busid 列表。设备枚举会抖动（`connectDevice` 期间系统可能短暂
   少列一台设备），靠界面记账迟早会和真实状态对不上。
@@ -235,12 +239,15 @@ usbManager.getFileDescriptor()                     usbipdcpp::LibusbServer
 找不到busid为1-3:0的设备
 ```
 
-**原因**：鸿蒙拿不到 sysfs 拓扑，busid 只能退化成 `<总线>-<设备地址>:<端口>`，
-而**设备地址每次重新枚举都会变**（插拔、系统重启 USB 栈、授权重开都可能变）。
-PC 端 usbip-win2 的 UDE 驱动会把 attach 过的设备存进注册表
+**原因**：早期版本的 busid 是 `总线-设备地址:端口`，而**设备地址每次重新枚举都会变**
+（插拔、系统重启 USB 栈、授权重开都可能变）。PC 端 usbip-win2 的 UDE 驱动会把
+attach 过的设备存进注册表
 （`HKLM\SYSTEM\CurrentControlSet\Services\usbip2_ude\PersistentState`），
 并**在驱动每次加载时自动重新 attach、失败后按指数退避重试**。
-它存的是当时那个 busid，于是设备地址一变，它就会持续拿着旧 busid 来敲门。
+它存的是当时那个 busid，地址一变就永远对不上，于是持续拿旧 busid 来敲门。
+
+**现在已经不成立了**：busid 改为由 `VID:PID:序列号` 推导，拔插不再改变。
+如果你手上的 PC 还存着旧值（形如 `1-3:0`），按下面清一次即可，之后不会再出现。
 
 服务端现在的处理是：**请求的 busid 对不上任何导出记录时，
 只回错误，绝不触碰正在使用的会话**。所以这种后台重试不会再打断你正在用的连接，

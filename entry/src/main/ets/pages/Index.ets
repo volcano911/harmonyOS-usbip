@@ -273,11 +273,35 @@ struct Index {
     return '';
   }
 
+  /**
+   * 服务端 busid —— 由设备身份（VID:PID[:序列号]）推导，与 native 的
+   * bindDevice 用的是同一个函数，所以两边永远一致。
+   *
+   * 这是「同一个设备拔插后 busid 就变」的根治办法：设备地址是系统临时分配的
+   * 座位号，不能当身份证用。
+   */
+  private stableBusidOf(d: SharedDevice): string {
+    try {
+      return usbipNative.stableBusid(d.busNum, d.vendorId, d.productId, d.serial, d.product);
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'stableBusid failed: %{public}s', JSON.stringify(e));
+      return '';
+    }
+  }
+
   private busidOf(device: SharedDevice, bound: string): string {
     if (bound.length === 0) {
       return '';
     }
     const parts: string[] = bound.split('|');
+    // 稳定 busid 优先：现在所有绑定都用它
+    const stable: string = this.stableBusidOf(device);
+    if (stable.length > 0) {
+      const hit: string = this.matchBusid(stable, parts);
+      if (hit.length > 0) {
+        return hit;
+      }
+    }
     const cands: string[] = device.busidCandidates();
     for (let c = 0; c < cands.length; c++) {
       const hit: string = this.matchBusid(cands[c], parts);
@@ -711,8 +735,9 @@ struct Index {
         this.refreshDevices();
         return false;
       }
-      this.appendLog(`[打开] ${device.name} fd=${fd} 期望 busid=${device.busNum}-${device.devAddress}`, LOG_INFO);
-      const code: number = usbipNative.bindDevice(fd);
+      const want: string = this.stableBusidOf(device);
+      this.appendLog(`[打开] ${device.name} fd=${fd} 稳定 busid=${want}（临时地址 ${device.busNum}-${device.devAddress}）`, LOG_INFO);
+      const code: number = usbipNative.bindDevice(fd, want);
       if (code !== 0) {
         this.service.closeDevice(device.name);
         this.appendLog(`[绑定] ${device.name} 失败 code=${code}${this.explainBindCode(code)}`, LOG_ERROR);

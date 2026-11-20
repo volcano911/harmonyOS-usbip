@@ -26,6 +26,28 @@ index 76fb5f4..ca20d5e 100644
      target_link_libraries(${PROJECT_NAME}_libusb PUBLIC ${PROJECT_NAME})
  endif ()
  
+diff --git a/include/usbipdcpp/LibusbHandler/LibusbServer.h b/include/usbipdcpp/LibusbHandler/LibusbServer.h
+index c013f53..9446f2e 100644
+--- a/include/usbipdcpp/LibusbHandler/LibusbServer.h
++++ b/include/usbipdcpp/LibusbHandler/LibusbServer.h
+@@ -107,7 +107,16 @@ public:
+      *
+      * @thread_safety 内部加锁，任意线程安全。
+      */
+-    DeviceOperationResult bind_host_device_with_wrapped_fd(intptr_t fd);
++    /**
++     * [OHOS 移植补丁] busid_override 非空时用它作为设备 busid，不再由
++     * get_device_busid() 从 libusb 拓扑推导。
++     *
++     * 鸿蒙拿不到 sysfs 拓扑，只能退化成 `总线-设备地址:端口`，而设备地址是
++     * 系统每次枚举临时分配的（拔插、授权重开都会变），拿它当身份会让客户端
++     * 缓存的 busid 永远失效。调用方（usbip_napi）改为传一个由 VID:PID:序列号
++     * 推导出的稳定 busid。
++     */
++    DeviceOperationResult bind_host_device_with_wrapped_fd(intptr_t fd, const std::string &busid_override = {});
+ 
+     /**
+      * @brief Unbind a previously bound physical USB device.
 diff --git a/include/usbipdcpp/Server.h b/include/usbipdcpp/Server.h
 index 44564a4..6c4900f 100644
 --- a/include/usbipdcpp/Server.h
@@ -186,7 +208,7 @@ index d883b5b..7d00c82 100644
      std::atomic_bool cmd_transferring = false;
  
 diff --git a/src/LibusbHandler/LibusbServer.cpp b/src/LibusbHandler/LibusbServer.cpp
-index fed7c8a..8430214 100644
+index fed7c8a..c403629 100644
 --- a/src/LibusbHandler/LibusbServer.cpp
 +++ b/src/LibusbHandler/LibusbServer.cpp
 @@ -55,9 +55,16 @@ std::vector<UsbInterface> build_usb_interfaces(const libusb_config_descriptor *c
@@ -209,6 +231,26 @@ index fed7c8a..8430214 100644
              }
              endpoints.push_back(std::move(alt_endpoints));
          }
+@@ -302,7 +309,7 @@ DeviceOperationResult LibusbServer::bind_host_device(libusb_device *dev) {
+     return DeviceOperationResult::Success;
+ }
+ 
+-DeviceOperationResult LibusbServer::bind_host_device_with_wrapped_fd(intptr_t fd) {
++DeviceOperationResult LibusbServer::bind_host_device_with_wrapped_fd(intptr_t fd, const std::string &busid_override) {
+     if (fd < 0) {
+         SPDLOG_ERROR("fd 无效");
+         return DeviceOperationResult::DeviceNotFound;
+@@ -348,7 +355,9 @@ DeviceOperationResult LibusbServer::bind_host_device_with_wrapped_fd(intptr_t fd
+     auto interfaces = build_usb_interfaces(active_config_desc);
+ 
+     // 保存设备信息
+-    auto busid = get_device_busid(device_for_info);
++    // [OHOS 移植补丁] 优先用调用方给的稳定 busid（见头文件说明）；没给才回退到
++    // libusb 拓扑推导（Linux/Android 上那是稳定的端口路径，没问题）。
++    auto busid = busid_override.empty() ? get_device_busid(device_for_info) : busid_override;
+     auto bus_num = libusb_get_bus_number(device_for_info);
+     auto dev_addr = libusb_get_device_address(device_for_info);
+     // devnum 填端口号（同普通模式，见 bind_host_device 的注释）
 diff --git a/src/Server.cpp b/src/Server.cpp
 index ac8202c..c071598 100644
 --- a/src/Server.cpp
