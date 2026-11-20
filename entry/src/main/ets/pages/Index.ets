@@ -8,15 +8,16 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
 import { SharedDevice, UsbDeviceService } from '../usbip/UsbDeviceService';
 import { keepAlive, KeepAliveState } from '../usbip/KeepAlive';
-import { DeviceMemory } from '../usbip/DeviceMemory';
 import { UsbWatcher } from '../usbip/UsbWatcher';
 import usbipNative from 'libusbip_napi.so';
 
 const DOMAIN = 0x3200;
 const TAG = 'UsbIpUi';
-const MAX_LOG_LINES: number = 300;
+/** 复制日志时要带上尽量完整的过程，300 行在调试期不够用 */
+const MAX_LOG_LINES: number = 800;
 
 /** iOS 系统色板，全页只用这几个 */
 const C_BG = '#F2F2F7';
@@ -76,16 +77,18 @@ struct Index {
   private service: UsbDeviceService = new UsbDeviceService();
   private logScroller: Scroller = new Scroller();
   private seq: number = 0;
-  /** 记住「插上就自动共享」的设备 */
-  private memory: DeviceMemory = new DeviceMemory();
   private watcher: UsbWatcher | null = null;
   /** 待刷入的日志行；高频日志按 120ms 合并一次，避免每条都触发整页重排 */
   private pendingLogs: LogLine[] = [];
   private flushTimer: number = -1;
-  /** 自动共享是否正在跑，防止 tick 与插入回调重入 */
-  private autoRunning: boolean = false;
-  /** 自动共享的尝试记录：key = identity@name，同一台设备同一地址只试一次 */
-  private autoTried: Map<string, number> = new Map();
+  /** 上次健康检查的时间戳，用来把 native 探测节流到 3 秒一次 */
+  private lastPruneAt: number = 0;
+  /** 上次状态快照的时间戳，心跳 15 秒一次，给日志留时间轴 */
+  private lastDumpAt: number = 0;
+  /** busid → 连续几轮没有对应在线设备（孤儿导出记录去抖） */
+  private orphanRounds: Map<string, number> = new Map();
+  /** name → 上次开关动作的时间戳；600ms 内不接受第二次操作，见 setShared */
+  private lastActionAt: Map<string, number> = new Map();
 
   aboutToAppear(): void {
     const ok: boolean = usbipNative.init();
@@ -100,7 +103,7 @@ struct Index {
       this.appendLog(`[保活] ${state.detail}`, state.active ? LOG_OK : LOG_WARN);
     });
     this.refreshDevices();
-    this.initAutoShare();
+    this.initWatcher();
   }
 
   aboutToDisappear(): void {
@@ -115,131 +118,112 @@ struct Index {
     }
   }
 
-  // ---------------- 自动识别 / 自动共享 ----------------
+  // ---------------- 插拔监听 ----------------
 
-  /** 加载记忆名册 + 启动插拔监听 */
-  private async initAutoShare(): Promise<void> {
+  /**
+   * 启动插拔监听。
+   *
+   * 只做一件事：把当前接着的设备如实列出来。**不做任何自动共享、
+   * 不记"上次用过哪台设备"** —— 每次插入都是独立的一次，用户点了开关才动。
+   *
+   * 这么定是被现实教育出来的：设备每次重新枚举，busid 里的 device address
+   * 都会变（1-2 → 1-4），任何"记住它、下次自动帮我打开"的逻辑都要跟这个变化
+   * 赛跑，赛输一次就成了"设备明明在，却报找不到 1-2 然后断开"。宁可多点一次。
+   */
+  private async initWatcher(): Promise<void> {
     try {
-      const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
-      await this.memory.init(ctx);
       const watcher: UsbWatcher = new UsbWatcher((): SharedDevice[] => this.service.list());
       watcher.onAttached = (device: SharedDevice): void => {
         this.handleAttached(device);
       };
-      watcher.onDetached = (name: string, identity: string): void => {
-        this.handleDetached(name, identity);
+      watcher.onDetached = (device: SharedDevice): void => {
+        this.handleDetached(device);
       };
+      // 列表一变只重建界面，不主动去绑任何设备
       watcher.onListChanged = (): void => {
         this.refreshDevices();
-        // 列表一变就试着补自动共享：不依赖「插入事件」是否被捕捉到
-        this.tryAutoShare();
+      };
+      watcher.onTick = (): void => {
+        // 与设备列表无关的两项检查：
+        //   1) 服务端导出记录的 fd 是否还活着（拔线漏报 → 幽灵 busid）
+        //   2) 导出记录里是否存在"当前枚举里根本没有的设备"（地址变了/换了口）
+        // 两者只要漏一次，客户端 devlist 里就会多出一个死 busid，
+        // 选中它必然得到「找不到busid为X的设备」并断开。
+        let changed: boolean = false;
+        if (this.pruneGhosts()) {
+          changed = true;
+        }
+        if (this.reapOrphans()) {
+          changed = true;
+        }
+        // 无论有没有清理动作都要重建列表。开关的"已共享"完全由服务端导出列表
+        // 决定，只在变化时刷新会让界面长期停在旧状态 —— 曾经出现过服务端正占用
+        // 着设备、界面却显示未共享，用户点开关必然撞"设备忙"。
+        this.refreshDevices();
+        if (changed) {
+          this.appendLog('[状态] 设备列表已刷新（服务端导出有变化）', LOG_INFO);
+        }
+        this.heartbeatDump();
       };
       this.watcher = watcher;
       await watcher.start(2000);
-      this.appendLog(`[监听] ${watcher.isEventDriven() ? '插拔事件' : '轮询 2s'} 已开启`
-        + ` · 记住 ${this.memory.count()} 台设备`, LOG_INFO);
-      await this.tryAutoShare();
+      this.appendLog(`[监听] ${watcher.isEventDriven() ? '插拔事件' : '轮询 2s'} 已开启`, LOG_INFO);
     } catch (err) {
-      hilog.error(DOMAIN, TAG, 'initAutoShare failed: %{public}s', JSON.stringify(err));
+      hilog.error(DOMAIN, TAG, 'initWatcher failed: %{public}s', JSON.stringify(err));
     }
   }
 
-  private async handleAttached(device: SharedDevice): Promise<void> {
+  private handleAttached(device: SharedDevice): void {
     try {
       this.refreshDevices();
       const entry: SharedDevice | null = this.findDevice(device.name);
-      if (entry !== null) {
-        this.appendLog(`[插入] ${entry.label()}`, LOG_INFO);
-      }
-      // 真正的判断交给 tryAutoShare：即使这里没认出「插入」，下一轮 tick 也会补上
-      await this.tryAutoShare();
+      const d: SharedDevice = entry !== null ? entry : device;
+      // name 是 USB 服务给的名字（可能形如 /dev/bus/usb/001/002），busNum/devAddress
+      // 才是 busid 的来源。两个都打出来，才能一眼看出「界面以为的 1-2」和
+      // 「服务端的 1-2:0」是不是同一台。
+      this.appendLog(`[插入] ${d.label()} name=${d.name} bus=${d.busNum}-${d.devAddress}`
+        + ` addr=${d.devAddress} sn=${d.serial.length > 0 ? d.serial : '-'}`, LOG_INFO);
+      this.logState('插入后');
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'handleAttached failed: %{public}s', JSON.stringify(err));
     }
   }
 
   /**
-   * 自动共享（状态驱动，不依赖插入事件）。
+   * 设备消失。
    *
-   * 之前只靠 onAttached 触发，有个硬伤：拔插发生在两次轮询之间时（<2s），
-   * Watcher 认为设备从没离开过，压根不会回调；加上 usbfs 地址会被复用，
-   * openDevice() 还可能命中已失效的旧 fd，表现就是「自动绑定毫无反应」。
-   * 现在改成：只要名册里的设备出现在列表中且未共享，就尝试一次。
+   * 关键点：这里拿到的是 UsbWatcher 保存的**上一轮快照**。设备已经从
+   * getDevices() 里消失，如果只用 name 去 this.devices 里找，多半找不到，
+   * 于是"通知服务端移除"这一步会被跳过 —— 服务端就永久留着一个已经不存在的
+   * busid。所以先用快照里的 busNum-devAddress 反推 busid，实在不行再用 name 兜。
    */
-  private async tryAutoShare(): Promise<void> {
-    if (this.autoRunning || this.memory.count() === 0) {
-      return;
-    }
-    this.autoRunning = true;
+  private async handleDetached(device: SharedDevice): Promise<void> {
     try {
-      const list: SharedDevice[] = this.devices;
-      for (let i = 0; i < list.length; i++) {
-        const d: SharedDevice = list[i];
-        if (d.shared) {
-          continue;
-        }
-        if (!this.memory.has(d)) {
-          continue;
-        }
-        const attempt: string = `${d.identity()}@${d.name}`;
-        if (this.autoTried.has(attempt)) {
-          continue;
-        }
-        this.autoTried.set(attempt, 1);
-        this.appendLog(`[自动] 命中名册 ${d.identity()}，尝试共享 ${d.label()}`, LOG_INFO);
-
-        if (!this.running) {
-          await this.startServer();
-          if (!this.running) {
-            this.appendLog('[自动] 服务起不来，跳过', LOG_ERROR);
-            return;
-          }
-        }
-        // 不在这里 closeDevice：shareDevice 内部要先判断服务端是否已经导出着，
-        // 先关 fd 会把"已共享"这条最优路径毁掉，反而制造出 busid 残留。
-        const ok: boolean = await this.shareDevice(d, false);
-        this.appendLog(ok ? `[自动] ${d.label()} 已共享` : `[自动] ${d.label()} 失败，可手动打开`,
-          ok ? LOG_OK : LOG_ERROR);
-      }
-    } finally {
-      this.autoRunning = false;
-    }
-  }
-
-  private async handleDetached(name: string, identity: string): Promise<void> {
-    try {
+      const name: string = device.name;
+      const bound: string = this.boundBusids();
       const entry: SharedDevice | null = this.findDevice(name);
-      // 列表可能已经刷新过（设备已不在 this.devices 里），再按 name 前缀从
-      // 服务端导出列表兜一次，否则拔线时通知不到服务端，记录会永远留着
-      let busid: string = entry !== null ? entry.busid : '';
+      let busid: string = entry !== null && entry.busid.length > 0 ? entry.busid : '';
       if (busid.length === 0) {
-        busid = this.busidOf(name, this.boundBusids());
+        busid = this.busidOf(device, bound);
       }
-      const wasShared: boolean = busid.length > 0;
-      if (wasShared) {
+      if (busid.length === 0) {
+        busid = this.busidByName(name, bound);
+      }
+      this.appendLog(`[拔出] ${device.label()} name=${name} bus=${device.busNum}-${device.devAddress}`
+        + ` 导出列表=${bound.length > 0 ? bound : '空'}`, LOG_WARN);
+      if (busid.length > 0) {
         const code: number = usbipNative.notifyDeviceRemoved(busid);
-        this.appendLog(`[拔出] ${name} · 已通知服务端(code=${code}, busid=${busid})`, LOG_WARN);
+        this.appendLog(`[拔出] 已通知服务端移除 ${busid} code=${code}`, code === 0 ? LOG_OK : LOG_WARN);
       } else {
-        this.appendLog(`[拔出] ${name}`, LOG_WARN);
+        this.appendLog('[拔出] 该设备没有对应的导出记录，无需通知', LOG_INFO);
       }
       this.service.closeDevice(name);
-      // 地址会被复用：清掉这台设备的尝试记录，重插后允许再试一次
-      this.clearAutoTried(name);
       this.refreshDevices();
+      if (busid.length > 0) {
+        this.logState('拔出后');
+      }
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'handleDetached failed: %{public}s', JSON.stringify(err));
-    }
-  }
-
-  private clearAutoTried(name: string): void {
-    const gone: string[] = [];
-    this.autoTried.forEach((_v: number, key: string) => {
-      if (key.lastIndexOf(`@${name}`) >= 0) {
-        gone.push(key);
-      }
-    });
-    for (let i = 0; i < gone.length; i++) {
-      this.autoTried.delete(gone[i]);
     }
   }
 
@@ -253,25 +237,63 @@ struct Index {
   }
 
   /**
+   * 取当前列表里同一台设备的最新对象。
+   *
+   * ArkUI 的 ForEach 按 key 复用子组件，闭包捕获的 device 可能是上一帧的对象；
+   * refreshDevices() 每 2 秒换一批新对象，往旧对象上写 shared/fd 不会反映到
+   * 列表里，还会让后续判断基于过期数据。所有交互入口都先走这里。
+   */
+  private liveOf(device: SharedDevice): SharedDevice {
+    const live: SharedDevice | null = this.findDevice(device.name);
+    return live !== null ? live : device;
+  }
+
+  /**
    * 从服务端导出的 busid 集合里取出这台设备对应的那一项，没有返回空串。
    *
-   * busid 形如 `1-2:0`，冒号前是端口路径，正好等于 usbManager 给的 name（`1-2`）。
+   * busid 由 libusb 生成，本机（拿不到 sysfs 拓扑）走的是 `总线-设备地址:端口`
+   * 这条分支，形如 `1-2:0`；其中 `2` 是 device address，**不是**端口号。
+   * 所以匹配必须用 busNum-devAddress，见 SharedDevice.busidCandidates()。
+   *
    * 界面判断"是否已共享"只认这个结果，不靠自己记账 —— 记账一旦漏一次，
    * 开关就会显示成关闭而服务端其实还导出着，用户再点一下必然撞 busid。
    */
-  private busidOf(name: string, bound: string): string {
-    if (bound.length === 0) {
+  private matchBusid(head: string, parts: string[]): string {
+    if (head.length === 0) {
       return '';
     }
-    const parts: string[] = bound.split('|');
-    const prefix: string = `${name}:`;
+    const colon: string = `${head}:`;
+    const dot: string = `${head}.`;
     for (let i = 0; i < parts.length; i++) {
       const b: string = parts[i];
-      if (b === name || b.indexOf(prefix) === 0) {
+      if (b === head || b.indexOf(colon) === 0 || b.indexOf(dot) === 0) {
         return b;
       }
     }
     return '';
+  }
+
+  private busidOf(device: SharedDevice, bound: string): string {
+    if (bound.length === 0) {
+      return '';
+    }
+    const parts: string[] = bound.split('|');
+    const cands: string[] = device.busidCandidates();
+    for (let c = 0; c < cands.length; c++) {
+      const hit: string = this.matchBusid(cands[c], parts);
+      if (hit.length > 0) {
+        return hit;
+      }
+    }
+    return '';
+  }
+
+  /** 设备已经从枚举里消失时用：只剩 name 可猜，且 name 必须是端口路径 */
+  private busidByName(name: string, bound: string): string {
+    if (bound.length === 0 || name.length === 0 || name.indexOf('/') >= 0) {
+      return '';
+    }
+    return this.matchBusid(name, bound.split('|'));
   }
 
   private boundBusids(): string {
@@ -283,14 +305,125 @@ struct Index {
     }
   }
 
+  /** busid 的前缀部分：`1-2:0` → `1-2`（本移植拿不到拓扑，格式恒为 总线-地址:端口） */
+  private busidHead(busid: string): string {
+    const c: number = busid.indexOf(':');
+    return c > 0 ? busid.substring(0, c) : busid;
+  }
+
+  /**
+   * 摘掉"服务端导出着、但当前根本没有对应设备"的记录。
+   *
+   * 这是第二阶段兜底：pruneGhosts 靠 fd 探测，能发现"设备没了但句柄还开着"；
+   * 但如果某次绑定失败、或设备在两次绑定之间换过地址，服务端也可能留下一条
+   * 从来没被探到的记录（比如 handler 里 native_handle 为空）。这类记录的特征
+   * 很明确：busid 前缀 `总线-地址` 不在当前枚举结果里。
+   *
+   * 去抖 2 轮（约 4 秒）：requestRight/connectDevice 期间 getDevices() 会短暂
+   * 缺项，一轮就摘会把正在用的导出踢掉，客户端立刻断。
+   *
+   * @returns 是否摘掉过记录
+   */
+  private reapOrphans(): boolean {
+    if (!this.running) {
+      this.orphanRounds.clear();
+      return false;
+    }
+    if (this.busy) {
+      // 授权/连接过程中枚举会抖动，这段时间不做任何判断
+      return false;
+    }
+    const present: string[] = [];
+    for (let i = 0; i < this.devices.length; i++) {
+      const d: SharedDevice = this.devices[i];
+      if (d.busNum <= 0) {
+        // 拿不到总线号时前缀构造不出来（会变成 0-0），此时任何比较都不可信
+        return false;
+      }
+      present.push(`${d.busNum}-${d.devAddress}`);
+    }
+    const bound: string = this.boundBusids();
+    if (bound.length === 0) {
+      this.orphanRounds.clear();
+      return false;
+    }
+    if (present.length === 0) {
+      // 列表偶尔会整轮返回空（系统正切 USB 状态），此时不能判定"全部失效"
+      return false;
+    }
+
+    const parts: string[] = bound.split('|');
+    const nextRounds: Map<string, number> = new Map();
+    let reaped: boolean = false;
+    for (let i = 0; i < parts.length; i++) {
+      const busid: string = parts[i];
+      if (busid.length === 0) {
+        continue;
+      }
+      const head: string = this.busidHead(busid);
+      if (present.indexOf(head) >= 0) {
+        continue;
+      }
+      const prev: number | undefined = this.orphanRounds.get(busid);
+      const rounds: number = prev === undefined ? 1 : prev + 1;
+      if (rounds < 2) {
+        nextRounds.set(busid, rounds);
+        this.appendLog(`[孤儿] ${busid} 对不上任何在线设备（第 ${rounds}/2 轮确认）`, LOG_WARN);
+        continue;
+      }
+      const code: number = usbipNative.notifyDeviceRemoved(busid);
+      this.appendLog(`[孤儿] ${busid} 已确认失效，摘除 code=${code}`, LOG_WARN);
+      reaped = true;
+    }
+    this.orphanRounds = nextRounds;
+    return reaped;
+  }
+
+  /** 打一份服务端状态快照（available / using 全列出来） */
+  private logState(reason: string): void {
+    let text: string = '';
+    try {
+      text = usbipNative.dumpState();
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'dumpState failed: %{public}s', JSON.stringify(err));
+      return;
+    }
+    if (text.length === 0) {
+      return;
+    }
+    this.appendLog(`[快照] ${reason}`, LOG_INFO);
+    const lines: string[] = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].length > 0) {
+        this.appendLog(lines[i], LOG_INFO);
+      }
+    }
+  }
+
+  /** 15 秒一次的状态心跳：出问题时能看出"什么时候还是好的" */
+  private heartbeatDump(): void {
+    if (!this.running) {
+      return;
+    }
+    const now: number = Date.now();
+    if (now - this.lastDumpAt < 15000) {
+      return;
+    }
+    this.lastDumpAt = now;
+    this.logState('心跳');
+  }
+
   // ---------------- 数据 ----------------
 
+  /** 带毫秒：拔插/绑定失败往往在几百毫秒内连发，秒级时间戳分不清先后 */
   private stamp(): string {
     const d: Date = new Date();
     const hh: string = d.getHours() < 10 ? `0${d.getHours()}` : `${d.getHours()}`;
     const mm: string = d.getMinutes() < 10 ? `0${d.getMinutes()}` : `${d.getMinutes()}`;
     const ss: string = d.getSeconds() < 10 ? `0${d.getSeconds()}` : `${d.getSeconds()}`;
-    return `${hh}:${mm}:${ss}`;
+    const ms: number = d.getMilliseconds();
+    const mss: string = ms < 100 ? (ms < 10 ? `00${ms}` : `0${ms}`) : `${ms}`;
+    return `${hh}:${mm}:${ss}.${mss}`;
   }
 
   private classify(line: string): number {
@@ -342,29 +475,117 @@ struct Index {
   }
 
   /**
+   * 复制日志到系统剪贴板。
+   *
+   * 只给屏幕上的 800 行还不够排查用：真正需要的是「当时的设备列表 + 服务端
+   * 导出列表 + 会话状态」和日志放在一起看。所以这里先拼一段头部快照
+   * （设备、busid、fd、available/using），再接原始日志。
+   */
+  private async copyLogs(): Promise<void> {
+    // 先把缓冲一起取进来，否则最后几行（往往正是出错那几行）会漏掉
+    const all: LogLine[] = this.logs.concat(this.pendingLogs);
+    this.flushLogs();
+    // 导出前重建一次：头部里的 shared/busid/fd 必须和服务端、service 的当前
+    // 状态一致，否则日志会自相矛盾（出现过"导出列表有 1-2:0"但设备行写
+    // shared=false，看日志的人会被带偏）
+    this.refreshDevices();
+    const now: Date = new Date();
+    const lines: string[] = [];
+    lines.push('===== HarmonyOS USB/IP 调试日志 =====');
+    lines.push(`导出时间 ${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()} ${this.stamp()}`);
+    lines.push(`服务状态 ${this.running ? '运行中' : '已停止'} 端口=${this.portText}`
+      + ` 保活=${this.keepAliveActive ? '生效' : this.keepAliveText}`);
+    lines.push(`当前设备 ${this.devices.length} 台：`);
+    for (let i = 0; i < this.devices.length; i++) {
+      const d: SharedDevice = this.devices[i];
+      lines.push(`  · ${d.label()} name=${d.name} bus=${d.busNum}-${d.devAddress}`
+        + ` busid=${d.busid.length > 0 ? d.busid : '-'} fd=${d.fd}`
+        + ` shared=${d.shared} sn=${d.serial.length > 0 ? d.serial : '-'}`);
+    }
+    const bound: string = this.boundBusids();
+    lines.push(`服务端导出列表：${bound.length > 0 ? bound : '空'}`);
+    try {
+      const state: string = usbipNative.dumpState();
+      if (state.length > 0) {
+        lines.push('--- 服务端快照 ---');
+        lines.push(state);
+      }
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'dumpState for copy failed: %{public}s', JSON.stringify(err));
+    }
+    lines.push('--- 日志 ---');
+    for (let i = 0; i < all.length; i++) {
+      lines.push(`${all[i].time} ${all[i].text}`);
+    }
+
+    const text: string = lines.join('\n');
+    try {
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      const board: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+      await board.setData(data);
+      promptAction.showToast({ message: `已复制 ${all.length} 行日志` });
+      this.appendLog(`[日志] 已复制到剪贴板（${all.length} 行，${text.length} 字）`, LOG_OK);
+    } catch (err) {
+      const e: BusinessError = err as BusinessError;
+      hilog.error(DOMAIN, TAG, 'copyLogs failed: code=%{public}d msg=%{public}s', e.code, e.message);
+      promptAction.showToast({ message: `复制失败 code=${e.code}` });
+    }
+  }
+
+  /**
    * 刷新设备列表。
    *
    * 「是否已共享」以服务端为准（getBoundBusids），不再靠按 name 继承上一帧的
    * shared 标记：name 在拔插后会变、列表对象每帧都是新建的，任何一次继承漏掉
    * 都会让开关显示成关闭，用户再点一次就撞 busid 报错。fd 仅用于展示，继承即可。
    */
+  /**
+   * 清掉"设备早拔了、服务端还导着"的幽灵 busid。
+   *
+   * libusb 的热插拔在鸿蒙上不可用：没有 udev，且我们为了避开设备发现还开了
+   * LIBUSB_OPTION_NO_DEVICE_DISCOVERY。所以服务端的拔出感知完全依赖 ArkTS
+   * 上报 —— 2 秒轮询 + 两轮去抖，快速拔插必然会被吞掉一次。
+   *
+   * 漏掉的后果就是这次的现场：导出列表里留着 `1-2:0`，而设备已经是 `1-4:0`。
+   * Windows 客户端 devlist 里两个都在，选中那个死的就回 UNBIND，弹
+   * "找不到 1-2 的设备"并断开连接。
+   *
+   * @returns 是否真的清理过（调用方据此决定要不要重建列表状态）
+   */
+  private pruneGhosts(): boolean {
+    if (!this.running) {
+      return false;
+    }
+    const now: number = Date.now();
+    if (now - this.lastPruneAt < 3000) {
+      return false;
+    }
+    this.lastPruneAt = now;
+    let dead: string = '';
+    try {
+      dead = usbipNative.pruneDeadDevices();
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'pruneDeadDevices failed: %{public}s', JSON.stringify(err));
+      return false;
+    }
+    if (dead.length === 0) {
+      return false;
+    }
+    this.appendLog(`[清理] 已移除失效的导出记录 ${dead}`, LOG_WARN);
+    return true;
+  }
+
   private refreshDevices(): void {
     const list: SharedDevice[] = this.service.list();
     const bound: string = this.boundBusids();
-    const prev: SharedDevice[] = this.devices;
     for (let i = 0; i < list.length; i++) {
-      const busid: string = this.busidOf(list[i].name, bound);
+      const busid: string = this.busidOf(list[i], bound);
       list[i].busid = busid;
       list[i].shared = busid.length > 0;
-      for (let j = 0; j < prev.length; j++) {
-        if (prev[j].name === list[i].name) {
-          list[i].fd = prev[j].fd;
-          break;
-        }
-      }
-      if (!list[i].shared) {
-        list[i].fd = -1;
-      }
+      // fd 只从 service 取，不再从上一帧的列表对象继承：
+      // 同一端口拔插后 name 不变，继承过来的 fd 早已失效，却会被当成"活的"
+      // 用在幂等判断里，结果就是服务端拿着死 fd 继续导出一个幽灵设备。
+      list[i].fd = this.service.fdOf(list[i].name);
     }
     this.devices = list;
   }
@@ -384,6 +605,7 @@ struct Index {
       this.running = true;
       this.portText = actual.toString();
       this.appendLog(`[服务] 已监听 0.0.0.0:${actual}`, LOG_OK);
+      this.logState('服务启动');
       const ctx: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
       const kept: boolean = await keepAlive.start(ctx);
       promptAction.showToast({
@@ -408,47 +630,63 @@ struct Index {
     }
     this.devices = this.devices.slice();
     this.running = false;
-    this.appendLog('[服务] 已停止', LOG_WARN);
+    this.lastDumpAt = 0;
+    this.orphanRounds.clear();
+    this.appendLog('[服务] 已停止，所有导出记录随服务端一起销毁', LOG_WARN);
     await keepAlive.stop();
     this.busy = false;
   }
 
-  /** 开关入口：按目标状态分发（ArkUI 的 onChange 在失败时需要回弹） */
+  /** 开关入口：按目标状态分发 */
   private async setShared(device: SharedDevice, wantOn: boolean): Promise<void> {
     if (!this.running) {
       promptAction.showToast({ message: '请先启动服务' });
-      this.devices = this.devices.slice();
+      this.refreshDevices();
       return;
     }
     if (wantOn === device.shared) {
       return;
     }
+    // 同一台设备的操作做个 600ms 冷却：连点、以及"点了之后列表刚好刷新"
+    // 这类时序问题都会产生第二次反向操作，而每次解绑都会 close 掉 fd，
+    // 客户端正在用的话直接就断了。
+    const now: number = Date.now();
+    const last: number = this.lastActionAt.get(device.name) ?? 0;
+    if (now - last < 600) {
+      this.appendLog(`[开关] ${device.name} 操作过于频繁（${now - last}ms），忽略`, LOG_WARN);
+      return;
+    }
+    this.lastActionAt.set(device.name, now);
     if (wantOn) {
-      await this.shareDevice(device, true);
+      await this.shareDevice(device);
     } else {
-      await this.unshareDevice(device, true);
+      await this.unshareDevice(device);
     }
   }
 
   /**
-   * 打开并绑定一台设备（幂等）。
-   * @param remember 是否把它记进「下次插上自动共享」的名册（自动共享时为 false）
+   * 打开并绑定一台设备（幂等，可重复点）。
+   *
+   * fd 复用很关键：以前每次绑定都 closeDevice + openDevice，等于让内核重新
+   * 走一遍 usbfs 打开流程（释放已 claim 的接口、设备复位）。设备被复位时
+   * 客户端的 URB 全部作废，表现就是"刚连上就掉、反复重连"。现在只要管道还
+   * 在就直接沿用，只有真的没有 fd（或它已经失效）才重新打开。
    */
-  private async shareDevice(device: SharedDevice, remember: boolean): Promise<boolean> {
+  private async shareDevice(device: SharedDevice): Promise<boolean> {
     this.busy = true;
     try {
+      const bound: string = this.busidOf(device, this.boundBusids());
+      const alive: number = this.service.fdOf(device.name);
+
       // ---- 幂等第一层：服务端已经导出着，且我们手上还有个活着的 fd ----
       // 此时不能再 closeDevice + openDevice：换来的新 fd 和 busid 会和旧记录
       // 撞（服务端按 busid 查重直接拒绝），而旧记录里的 fd 已经被我们关掉，
       // 客户端一连就断。最优做法是什么都不做。
-      let bound: string = this.busidOf(device.name, this.boundBusids());
-      if (bound.length > 0 && device.fd >= 0) {
+      if (bound.length > 0 && alive >= 0) {
         device.shared = true;
         device.busid = bound;
+        device.fd = alive;
         this.appendLog(`[绑定] ${device.name} 已在共享中（busid=${bound}），跳过`, LOG_INFO);
-        if (remember) {
-          await this.memory.remember(device);
-        }
         this.devices = this.devices.slice();
         return true;
       }
@@ -461,34 +699,34 @@ struct Index {
         usbipNative.notifyDeviceRemoved(bound);
       }
 
-      // 每次绑定都重新走一遍 requestRight → connectDevice → getFileDescriptor。
-      // 复用缓存句柄在「拔插过一次、地址又被系统复用」时会拿到失效 fd。
-      this.service.closeDevice(device.name);
-      device.fd = -1;
-      const fd: number = await this.service.openDevice(device.name);
+      let fd: number = alive;
+      if (fd < 0) {
+        fd = await this.service.openDevice(device.name);
+      } else {
+        this.appendLog(`[打开] ${device.name} 复用已有 fd=${fd}`, LOG_INFO);
+      }
       if (fd < 0) {
         this.appendLog(`[打开] ${device.name} 失败（授权被拒或系统占用）`, LOG_ERROR);
         promptAction.showToast({ message: '打开设备失败' });
-        this.devices = this.devices.slice();
+        this.refreshDevices();
         return false;
       }
+      this.appendLog(`[打开] ${device.name} fd=${fd} 期望 busid=${device.busNum}-${device.devAddress}`, LOG_INFO);
       const code: number = usbipNative.bindDevice(fd);
       if (code !== 0) {
         this.service.closeDevice(device.name);
         this.appendLog(`[绑定] ${device.name} 失败 code=${code}${this.explainBindCode(code)}`, LOG_ERROR);
         promptAction.showToast({ message: `绑定失败 code=${code}` });
-        this.devices = this.devices.slice();
+        this.refreshDevices();
+        this.logState('绑定失败后');
         return false;
       }
       device.shared = true;
       device.fd = fd;
       device.busid = usbipNative.getLastBusid();
       this.appendLog(`[绑定] ${device.name} → busid=${device.busid}`, LOG_OK);
-      if (remember) {
-        await this.memory.remember(device);
-      }
-      // 放在 remember 之后：列表重建时读到的 memory 才是最新的（"自动"角标）
       this.devices = this.devices.slice();
+      this.logState('绑定后');
       return true;
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'shareDevice failed: %{public}s', JSON.stringify(err));
@@ -515,16 +753,16 @@ struct Index {
   }
 
   /**
-   * 解绑并关闭一台设备；remember=true 表示是用户手动关的，要一并忘掉。
+   * 解绑并关闭一台设备。
    *
    * 必须按 busid 走「设备移除」通道，不能用 unbindDevice(fd)：
    * 设备正被客户端使用时，unbind_host_device_by_fd 会返回 DeviceInUse 且
    * 什么都不做 —— 界面关了、服务端还导着，这就是下次打不开的直接原因。
    */
-  private async unshareDevice(device: SharedDevice, remember: boolean): Promise<void> {
+  private async unshareDevice(device: SharedDevice): Promise<void> {
     let busid: string = device.busid;
     if (busid.length === 0) {
-      busid = this.busidOf(device.name, this.boundBusids());
+      busid = this.busidOf(device, this.boundBusids());
     }
 
     let code: number = -1;
@@ -540,11 +778,6 @@ struct Index {
     device.shared = false;
     device.fd = -1;
     device.busid = '';
-    if (remember) {
-      await this.memory.forget(device);
-      // 手动关掉的设备不要再被自动共享拉起来
-      this.clearAutoTried(device.name);
-    }
     this.devices = this.devices.slice();
 
     if (code === 0 && busid.length > 0) {
@@ -556,17 +789,19 @@ struct Index {
 
   /** 解绑后的收敛：每 50ms 查一次服务端，最多 600ms，不阻塞 UI */
   private settleUnbind(device: SharedDevice, busid: string, round: number): void {
-    const still: boolean = this.busidOf(device.name, this.boundBusids()).length > 0;
+    const still: boolean = this.busidOf(device, this.boundBusids()).length > 0;
     if (!still) {
       if (round > 0) {
         this.appendLog(`[解绑] ${device.name} 已从导出列表移除`, LOG_OK);
       }
       this.refreshDevices();
+      this.logState('解绑后');
       return;
     }
     if (round >= 12) {
       this.appendLog(`[解绑] ${device.name} 仍在导出列表（客户端可能还连着）`, LOG_WARN);
       this.refreshDevices();
+      this.logState('解绑未收敛');
       return;
     }
     setTimeout(() => {
@@ -873,14 +1108,6 @@ struct Index {
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
-            if (this.memory.has(device)) {
-              Text('自动')
-                .fontSize(10)
-                .fontColor(C_GREEN_TEXT)
-                .backgroundColor(C_GREEN_BG)
-                .padding({ left: 5, right: 5, top: 1, bottom: 1 })
-                .borderRadius(4)
-            }
           }
           .width('100%')
           Row({ space: 6 }) {
@@ -909,17 +1136,42 @@ struct Index {
           .padding({ left: 8, right: 10, top: 8, bottom: 8 })
           .enabled(!this.busy)
           .onClick(() => {
-            this.probe(device);
+            // ForEach 按 name 复用组件，捕获的 device 可能已经被 refreshDevices
+            // 换成了旧对象；按 name 取当前对象，避免把状态改在一份孤儿数据上
+            this.probe(this.liveOf(device));
           })
 
-        Toggle({ type: ToggleType.Switch, isOn: device.shared })
-          .selectedColor(C_GREEN)
-          .enabled(!this.busy)
-          .onChange((isOn: boolean) => {
-            if (isOn !== device.shared) {
-              this.setShared(device, isOn);
-            }
-          })
+        // 自己画的开关，不用 Toggle。
+        //
+        // Toggle 的 isOn 是单向入参：程序里把 shared 改成 true 后，ArkUI 会在
+        // 下一帧用新的 isOn 重建开关，并把这次"程序改动"当成一次用户操作回推
+        // 一次 onChange。debug 日志里 `[绑定] 1-4 → busid=1-4:0` 和
+        // `[解绑] 1-4 busid=1-4:0 已提交` 相隔 1 毫秒，就是这么来的 ——
+        // 刚绑上就被自己解绑，fd 反复 close/reopen，设备被反复复位，客户端
+        // 那边自然"看起来连上了却什么都没发生"。
+        //
+        // 这个开关只有 onClick 一个入口，状态永远只由服务端导出列表决定，
+        // 不存在框架反向回推的可能。
+        Stack() {
+          Circle()
+            .width(25)
+            .height(25)
+            .fill(Color.White)
+            .shadow({ radius: 2, color: '#26000000', offsetY: 1 })
+            .position({ x: device.shared ? 23 : 3, y: 3 })
+            .animation({ duration: 160, curve: Curve.EaseOut })
+        }
+        .width(51)
+        .height(31)
+        .borderRadius(15.5)
+        .backgroundColor(device.shared ? C_GREEN : '#E9E9EB')
+        .animation({ duration: 160, curve: Curve.EaseOut })
+        .enabled(!this.busy)
+        .opacity(this.busy ? 0.5 : 1)
+        .onClick(() => {
+          const live: SharedDevice = this.liveOf(device);
+          this.setShared(live, !live.shared);
+        })
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: 13, bottom: 13 })
@@ -981,7 +1233,7 @@ struct Index {
         Column() {
           ForEach(this.devices, (device: SharedDevice, index: number) => {
             this.deviceRow(device, index === this.devices.length - 1)
-          }, (device: SharedDevice) => device.name)
+          }, (device: SharedDevice) => `${device.name}|${device.shared}|${device.fd}|${device.busid}`)
         }
         .width('100%')
         .backgroundColor(C_CARD)
@@ -996,14 +1248,21 @@ struct Index {
   @Builder
   logSection() {
     Column() {
-      Row() {
+      Row({ space: 16 }) {
         this.caption('运行日志')
         Blank()
+        Text('复制')
+          .fontSize(15)
+          .fontColor(C_BLUE)
+          .onClick(() => {
+            this.copyLogs();
+          })
         Text('清空')
           .fontSize(15)
           .fontColor(C_BLUE)
           .onClick(() => {
             this.logs = [];
+            this.pendingLogs = [];
           })
       }
       .width('100%')

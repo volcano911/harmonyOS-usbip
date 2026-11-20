@@ -33,6 +33,7 @@
 
 #include <usbipdcpp/Server.h>
 #include <usbipdcpp/LibusbHandler/LibusbServer.h>
+#include <usbipdcpp/LibusbHandler/LibusbDeviceHandler.h>
 #include <usbipdcpp/LibusbHandler/LibusbDeviceHandlerConfig.h>
 #include <usbipdcpp/LibusbHandler/tools.h>
 
@@ -67,6 +68,67 @@ bool g_running = false;
 int g_port = -1;
 std::string g_last_busid;
 napi_threadsafe_function g_log_tsfn = nullptr;
+
+const char *ReleaseReasonText(usbipdcpp::DeviceReleaseReason reason) {
+    switch (reason) {
+        case usbipdcpp::DeviceReleaseReason::ClientDisconnected: return "客户端断开";
+        case usbipdcpp::DeviceReleaseReason::DeviceRemoved: return "设备移除";
+        case usbipdcpp::DeviceReleaseReason::ServerStopped: return "服务停止";
+        default: return "未知";
+    }
+}
+
+std::string DescribeDevice(const std::shared_ptr<usbipdcpp::UsbDevice> &dev) {
+    if (!dev) {
+        return "空记录";
+    }
+    auto handler = std::dynamic_pointer_cast<usbipdcpp::LibusbDeviceHandler>(dev->handler);
+    const bool has_handle = handler != nullptr && handler->native_handle != nullptr;
+    const bool removed = handler != nullptr && handler->is_device_removed();
+    char buf[256];
+    snprintf(buf, sizeof(buf), "busid=%s vid=%04x pid=%04x bus=%u dev=%u handle=%s removed=%s",
+             dev->busid.c_str(), dev->vendor_id, dev->product_id,
+             static_cast<unsigned>(dev->bus_num), static_cast<unsigned>(dev->dev_num),
+             has_handle ? "有" : "无", removed ? "是" : "否");
+    return buf;
+}
+
+/**
+ * 服务端事件观察器。
+ *
+ * 这是排查「客户端说找不到某个 busid」的唯一可靠线索：usbipdcpp 的
+ * try_moving_device_to_using() 在收到 IMPORT 却找不到设备时会打
+ * 「找不到busid为X的设备」，但不告诉我们 X 是谁、什么时候来的。
+ * 这里把会话建立/结束、设备进入导出列表/被客户端取走/被释放全部记下来，
+ * 时间顺序一对，就能看出客户端到底在 attach 哪个 busid、它是什么时候消失的。
+ *
+ * 生命周期：静态对象，进程退出前一直存在；每次 startServer 注册，
+ * stopServer 前反注册，避免服务端析构后还回调。
+ */
+class DiagObserver final : public usbipdcpp::ServerObserver {
+public:
+    void on_session_started(std::uint64_t session_id, const std::string &peer) override {
+        spdlog::info("[客户端] 连接 #{} 来自 {}", session_id, peer);
+    }
+
+    void on_session_ended(std::uint64_t session_id) override {
+        spdlog::info("[客户端] 断开 #{}", session_id);
+    }
+
+    void on_device_added(const std::string &busid) override {
+        spdlog::info("[导出] 进入可导出列表 {}", busid);
+    }
+
+    void on_device_attached(const std::string &busid) override {
+        spdlog::warn("[导出] 客户端已占用 {}", busid);
+    }
+
+    void on_device_released(const std::string &busid, usbipdcpp::DeviceReleaseReason reason) override {
+        spdlog::warn("[导出] 释放 {} 原因={}", busid, ReleaseReasonText(reason));
+    }
+};
+
+DiagObserver g_observer;
 
 // ---------------------------------------------------------------- 日志汇
 
@@ -356,6 +418,7 @@ napi_value BindDevice(napi_env env, napi_callback_info info) {
 
         // 先取 busid 再绑定：取不到就直接返回，不留"绑上了却报不出 busid"的半成品
         std::string busid;
+        int dev_addr = -1;
         {
             libusb_device_handle *tmp = nullptr;
             int err = libusb_wrap_sys_device(nullptr, static_cast<intptr_t>(fd), &tmp);
@@ -366,13 +429,15 @@ napi_value BindDevice(napi_env env, napi_callback_info info) {
             libusb_device *dev = libusb_get_device(tmp);
             if (dev != nullptr) {
                 busid = usbipdcpp::get_device_busid(dev);
+                dev_addr = libusb_get_device_address(dev);
             }
             libusb_close(tmp);
         }
         if (busid.empty()) {
-            spdlog::error("取 busid 失败");
+            spdlog::error("取 busid 失败 fd={}", fd);
             return MakeInt(env, ErrorCode::DEVICE_NOT_FOUND);
         }
+        spdlog::info("请求绑定 fd={} busid={} addr={}", fd, busid, dev_addr);
 
         auto result = g_server->bind_host_device_with_wrapped_fd(static_cast<intptr_t>(fd));
         int code = ToErrorCode(result);
@@ -482,6 +547,8 @@ napi_value StartServer(napi_env env, napi_callback_info info) {
         // 关闭热插拔：OHOS 侧由 ArkTS 订阅 USB 插拔事件后显式调 bind/unbind，
         // 不依赖 libusb 自己枚举（沙箱里既没有 udev 也没有 /dev 枚举权限）
         g_server->set_hotplug_enabled(false);
+        // 事件观察器：会话/设备生命周期全记录，排查"找不到 busid"必备
+        g_server->get_server().add_observer(&g_observer);
 
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), static_cast<unsigned short>(port));
         auto ec = g_server->start(endpoint);
@@ -499,6 +566,10 @@ napi_value StartServer(napi_env env, napi_callback_info info) {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_server) {
             try {
+                g_server->get_server().remove_observer(&g_observer);
+            } catch (...) {
+            }
+            try {
                 g_server->stop();
             } catch (...) {
             }
@@ -515,6 +586,11 @@ napi_value StopServer(napi_env env, napi_callback_info /*info*/) {
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_server) {
+            // 先反注册再 stop：stop 会触发设备释放通知，observers 列表里不能再有我们
+            try {
+                g_server->get_server().remove_observer(&g_observer);
+            } catch (...) {
+            }
             g_server->stop();
             g_server.reset();
         }
@@ -573,8 +649,165 @@ napi_value GetBoundBusids(napi_env env, napi_callback_info /*info*/) {
     }
 }
 
-/** setLogCallback(cb) —— 注册/清空日志回调 */
-napi_value SetLogCallback(napi_env env, napi_callback_info info) {
+/**
+ * pruneDeadDevices() —— 探一次"已导出设备还能不能用"，把幽灵记录清掉。
+ *
+ * 为什么必须自己做：libusb 的热插拔依赖 udev/netlink，鸿蒙没有；而且我们在
+ * LIBUSB_OPTION_NO_DEVICE_DISCOVERY 下初始化，libusb 自身也没有设备发现，
+ * libusb_hotplug 永远不会触发。所以服务端的拔出感知完全靠 ArkTS 上报，
+ * 漏一次就在导出列表里留下一个已经不存在的 busid。客户端 devlist 仍能看到
+ * 它，一 attach 就被回 UNBIND，表现成「找不到 1-2 的设备然后断开」。
+ *
+ * 探测手段是读一次设备描述符（标准请求，所有设备都实现）：usbfs 对已经
+ * 拔掉的 fd 做任何 ioctl 都返回 ENODEV，libusb 翻成 LIBUSB_ERROR_NO_DEVICE。
+ * 只清这一种，超时 / PIPE / 被取消一律不动，避免把"忙"当成"死"。
+ *
+ * 早期版本只查 available，刻意跳过 using —— 结果最典型的幽灵恰恰在 using 里：
+ * 客户端一直挂在某台设备上但设备本身没有 URB 往来（加密狗、HID、待机状态的
+ * 串口都是这样），拔掉/重新枚举后没有任何 URB 失败，会话不会自己收尾，
+ * 那条 busid 就永久留在 using_devices 里。客户端断开重连时再 attach 它，
+ * 服务端 available 里当然找不到，于是回「找不到busid为X的设备」。
+ * 现在 using 也一起探，控制传输只读 18 字节描述符，对正常会话无副作用。
+ *
+ * 返回被清掉的 busid，'|' 分隔；没有则返回空串。
+ */
+napi_value PruneDeadDevices(napi_env env, napi_callback_info /*info*/) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_server) {
+            return MakeString(env, "");
+        }
+
+        std::vector<std::string> dead;
+        {
+            auto &srv = g_server->get_server();
+
+            // 先做快照，再在**锁外**探测。原来是在 devices_mutex 的读锁里直接
+            // 发控制传输：parse_op 导入设备时会先持 current_import_device_data_mutex
+            // 再去拿 devices_mutex 的写锁，而我们的探测路径是 devices_mutex 读锁
+            // + idle 查询要拿 current_import_device_data_mutex —— 两者交叉就是
+            // 死锁。设备指针本身是 shared_ptr，拷出来就能保证生命周期。
+            std::vector<std::shared_ptr<usbipdcpp::UsbDevice>> available_snapshot;
+            std::vector<std::shared_ptr<usbipdcpp::UsbDevice>> using_snapshot;
+            std::vector<std::string> using_busids;
+            {
+                std::shared_lock<std::shared_mutex> devices_lock(srv.get_devices_mutex());
+                for (const auto &dev: srv.get_available_devices()) {
+                    available_snapshot.push_back(dev);
+                }
+                for (const auto &entry: srv.get_using_devices()) {
+                    using_snapshot.push_back(entry.second);
+                    using_busids.push_back(entry.first);
+                }
+            }
+
+            auto probe = [&dead](const std::shared_ptr<usbipdcpp::UsbDevice> &dev, const char *state) {
+                auto handler = std::dynamic_pointer_cast<usbipdcpp::LibusbDeviceHandler>(dev->handler);
+                if (!handler || handler->native_handle == nullptr) {
+                    return;
+                }
+                // 18 字节设备描述符，wValue=0x0100(DEVICE)、index=0，无副作用
+                unsigned char desc[18] = {};
+                int rc = libusb_control_transfer(handler->native_handle,
+                                                 0x80, 0x06, 0x0100, 0x0000,
+                                                 desc, sizeof(desc), 100);
+                if (rc == LIBUSB_ERROR_NO_DEVICE) {
+                    spdlog::warn("健康检查：{} 的 fd 已失效（{}），判定为幽灵记录", dev->busid, state);
+                    dead.push_back(dev->busid);
+                } else if (rc < 0) {
+                    // 超时/PIPE/忙 都不算死：设备可能只是暂时没响应控制传输
+                    spdlog::debug("健康检查：{} 探测返回 {}，保留", dev->busid, rc);
+                }
+            };
+
+            // 空闲导出的设备：随时可以探（没人用它）
+            for (const auto &dev: available_snapshot) {
+                probe(dev, "available");
+            }
+
+            // 客户端正在使用的设备：**不能无条件探**。
+            //
+            // 之前这里是每 3 秒对 using 里的设备插一发 GET_DESCRIPTOR。客户端
+            // （尤其 Windows 侧）attach 之后有一段密集的枚举/配置时序，此时端点 0
+            // 上被别处插进一发控制传输，很容易让它本该完成的 URB 迟迟不回来 ——
+            // 日志里那一串 "unlinked by a call to usb_unlink_urb()" 就是客户端
+            // 等不到完成包、自己取消 URB 留下的痕迹。设备于是"看起来连上了，
+            // 实际不出数据"。
+            //
+            // 现在只有占用方已经静默足够久（基本可以认定这个会话已经废了）才探。
+            // 真断掉的连接由 TCP keepalive（约 25 秒）和僵尸会话接管负责收尾，
+            // 健康检查只做最后一道保险。
+            constexpr int kProbeUsingIdleSeconds = 30;
+            for (size_t i = 0; i < using_busids.size(); i++) {
+                const int idle = srv.using_device_idle_seconds(using_busids[i]);
+                if (idle >= 0 && idle < kProbeUsingIdleSeconds) {
+                    continue;
+                }
+                probe(using_snapshot[i], "using");
+            }
+        }
+
+        std::string out;
+        for (const auto &busid: dead) {
+            // 锁已经放开再摘：notify_device_removed 内部要拿 devices_mutex 的写锁
+            g_server->notify_device_removed(busid);
+            if (!out.empty()) {
+                out.push_back('|');
+            }
+            out += busid;
+        }
+        if (!dead.empty()) {
+            spdlog::warn("健康检查：{} 个 busid 的 fd 已失效，已从导出列表移除", dead.size());
+        }
+        return MakeString(env, out);
+    } catch (const std::exception &e) {
+        LOGE("pruneDeadDevices threw: %{public}s", e.what());
+        return MakeString(env, "");
+    } catch (...) {
+        return MakeString(env, "");
+    }
+}
+
+/**
+ * dumpState() —— 服务端当前状态的完整快照，多行文本。
+ *
+ * 排查「客户端 attach 的 busid 和我以为的不一样」这类问题时，只看零散日志
+ * 很难还原：设备列表、导出列表、客户端占用了哪个，必须同时看到。UI 在绑定/
+ * 解绑/插拔/复制日志时各打一次，等于给现场拍快照。
+ */
+napi_value DumpState(napi_env env, napi_callback_info /*info*/) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_server) {
+            return MakeString(env, "[状态] 服务未启动，导出列表为空");
+        }
+        auto &srv = g_server->get_server();
+        std::shared_lock<std::shared_mutex> devices_lock(srv.get_devices_mutex());
+        const auto &available = srv.get_available_devices();
+        const auto &using_devices = srv.get_using_devices();
+
+        std::string out = "服务运行中 端口=" + std::to_string(g_port)
+                          + " 空闲导出=" + std::to_string(available.size())
+                          + " 客户端占用=" + std::to_string(using_devices.size());
+        for (const auto &dev: available) {
+            out += "\n[状态] 空闲   " + DescribeDevice(dev);
+        }
+        for (const auto &entry: using_devices) {
+            out += "\n[状态] 占用中 " + DescribeDevice(entry.second);
+        }
+        if (available.empty() && using_devices.empty()) {
+            out += "\n[状态] 当前没有任何导出记录";
+        }
+        return MakeString(env, out);
+    } catch (const std::exception &e) {
+        LOGE("dumpState threw: %{public}s", e.what());
+        return MakeString(env, "[状态] 读取失败");
+    } catch (...) {
+        return MakeString(env, "[状态] 读取失败");
+    }
+}
+
+/** setLogCallback(cb) —— 注册/清空日志回调 */napi_value SetLogCallback(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -637,8 +870,14 @@ napi_value NotifyDeviceRemoved(napi_env env, napi_callback_info info) {
         if (!g_server) {
             return MakeInt(env, ErrorCode::SERVER_NOT_RUNNING);
         }
-        spdlog::info("设备已拔出 busid={}", busid);
+        const bool existed = g_server->get_server().has_bound_device(busid);
+        spdlog::info("请求移除导出 busid={} 服务端存在={}", busid, existed ? "是" : "否");
         int code = ToErrorCode(g_server->notify_device_removed(busid));
+        if (code == ErrorCode::SUCCESS) {
+            spdlog::info("导出已移除 busid={}", busid);
+        } else {
+            spdlog::warn("移除导出失败 busid={} code={}", busid, code);
+        }
         if (g_last_busid == busid) {
             g_last_busid.clear();
         }
@@ -695,6 +934,8 @@ napi_value Init(napi_env env, napi_value exports) {
             {"stopServer", nullptr, StopServer, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"isRunning", nullptr, IsRunning, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"getBoundBusids", nullptr, GetBoundBusids, nullptr, nullptr, nullptr, napi_default, nullptr},
+            {"pruneDeadDevices", nullptr, PruneDeadDevices, nullptr, nullptr, nullptr, napi_default, nullptr},
+            {"dumpState", nullptr, DumpState, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"setLogCallback", nullptr, SetLogCallback, nullptr, nullptr, nullptr, napi_default, nullptr},
             {"setLogLevel", nullptr, SetLogLevel, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

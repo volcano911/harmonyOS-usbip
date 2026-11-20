@@ -30,26 +30,31 @@ export class SharedDevice {
   clazz: number = 0;
   /** 设备序列号；部分设备不提供，此时为空串 */
   serial: string = '';
+  /** USB 总线号。与 devAddress 一起构成 busid 的前缀，见 busidCandidates() */
+  busNum: number = 0;
+  /** 设备地址（usbfs 上叫 devnum），每次插拔由系统重新分配 */
+  devAddress: number = 0;
   fd: number = -1;
   /** 绑定成功后的 busid，解绑/掉线通知用 */
   busid: string = '';
   shared: boolean = false;
 
-  constructor(name: string, vendorId: number, productId: number, manufacturer: string,
-              product: string, clazz: number, serial: string = '') {
-    this.name = name;
-    this.vendorId = vendorId;
-    this.productId = productId;
-    this.manufacturer = manufacturer;
-    this.product = product;
-    this.clazz = clazz;
-    this.serial = serial;
+  constructor(d: Readonly<usbManager.USBDevice>) {
+    this.name = d.name;
+    this.vendorId = d.vendorId;
+    this.productId = d.productId;
+    this.manufacturer = d.manufacturerName ?? '';
+    this.product = d.productName ?? '';
+    this.clazz = d.clazz;
+    this.serial = d.serial ?? '';
+    this.busNum = d.busNum;
+    this.devAddress = d.devAddress;
   }
 
   /**
    * 跨越插拔的稳定身份。
    *
-   * name（/dev/bus/usb/001/002）里的 devAddress 每次插拔都会变，不能当身份。
+   * devAddress（也就是 busid 里 `1-2` 的那个 2）每次插拔都会变，不能当身份。
    * 有序列号时 vid:pid:serial 唯一；没有序列号只能退到 vid:pid:产品名，
    * 此时两个同型号设备会被认成同一台（可接受，日志里会写明）。
    */
@@ -65,6 +70,30 @@ export class SharedDevice {
   /** 是否具备可靠身份（有序列号） */
   hasStableIdentity(): boolean {
     return this.serial.length > 0;
+  }
+
+  /**
+   * 服务端 busid 的所有可能前缀，按可信度排序。
+   *
+   * busid 由 libusb 的 get_device_busid() 生成，两条分支：
+   *   1) 能读到拓扑端口时 → `总线-端口[.端口]`，例如 `1-4`
+   *   2) 读不到时（本移植走的就是这条，鸿蒙没有 sysfs 拓扑）→
+   *      `总线-设备地址:端口`，例如 `1-2:0`
+   *
+   * 所以第 2 种必须用 busNum-devAddress 来对，而**不能**用 name —— name 是
+   * USB 服务给的名字，与 libusb 的地址无关。之前拿 name 当后缀前缀匹配，
+   * 匹配不上就会把"已共享"误判成"未共享"，然后重复绑定撞 AlreadyBound。
+   */
+  busidCandidates(): string[] {
+    const out: string[] = [];
+    if (this.busNum > 0) {
+      out.push(`${this.busNum}-${this.devAddress}`);
+    }
+    if (this.name.length > 0 && this.name.indexOf('/') < 0) {
+      // 兼容拓扑可用的机器：此时 busid 就是端口路径，name 恰好也长这样
+      out.push(this.name);
+    }
+    return out;
   }
 
   label(): string {
@@ -99,15 +128,7 @@ export class UsbDeviceService {
       for (let i = 0; i < devices.length; i++) {
         const d: Readonly<usbManager.USBDevice> = devices[i];
         present.push(d.name);
-        out.push(new SharedDevice(
-          d.name,
-          d.vendorId,
-          d.productId,
-          d.manufacturerName ?? '',
-          d.productName ?? '',
-          d.clazz,
-          d.serial ?? ''
-        ));
+        out.push(new SharedDevice(d));
       }
       // 拿到完整列表后再回收，避免 getDevices 抛异常时把缓存全清空
       this.prune(present);

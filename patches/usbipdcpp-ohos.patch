@@ -27,7 +27,7 @@ index 76fb5f4..ca20d5e 100644
  endif ()
  
 diff --git a/include/usbipdcpp/Server.h b/include/usbipdcpp/Server.h
-index 44564a4..c13bd95 100644
+index 44564a4..6c4900f 100644
 --- a/include/usbipdcpp/Server.h
 +++ b/include/usbipdcpp/Server.h
 @@ -38,9 +38,12 @@ enum class ThreadPurpose {
@@ -45,6 +45,146 @@ index 44564a4..c13bd95 100644
      /// 是否禁用 Nagle 算法（减少小包延迟）
      bool tcp_no_delay = true;
  };
+@@ -275,6 +278,23 @@ public:
+         return devices_mutex;
+     }
+ 
++    /**
++     * [OHOS 移植补丁] 占用某台设备的会话已经静默多少秒。
++     *
++     * 两个用途：
++     *   1) takeover_stale_session 判断占用方是不是僵尸会话；
++     *   2) 健康检查（pruneDeadDevices）决定能不能对 using 里的设备做控制传输探测
++     *      —— 客户端正在传数据时插一发 GET_DESCRIPTOR 会打乱它的枚举/时序，
++     *      所以只有确认它已经静默一段时间才允许探测。
++     *
++     * 放在 public 区是因为健康检查在应用侧的 napi 桥接层（不是 Server 的成员
++     * 函数），protected 里调不到。
++     *
++     * @return 秒数；设备不在 using 列表或找不到对应会话时返回 -1
++     * @thread_safety 内部加锁，任意线程安全（会短暂持 session_list_mutex）
++     */
++    int using_device_idle_seconds(const std::string &busid);
++
+     /**
+      * @brief 注册状态观察者（幂等：同一指针重复注册只保留一个）
+      * @param observer 观察者指针；库不接管所有权，生命周期必须覆盖 Server
+@@ -403,6 +423,39 @@ protected:
+      */
+     std::shared_ptr<UsbDevice> try_moving_device_to_using(const std::string &busid);
+ 
++    /**
++     * [OHOS 移植补丁] 接管"僵尸会话"占用的设备。
++     *
++     * 客户端的 TCP 连接常常在端口失效后仍被进程持有：服务端读不到 EOF、也没有
++     * 后续流量，设备就永久留在 using 列表里，客户端重新 attach 永远得到"设备忙"，
++     * 用户只能停服务重开。这里在占用方静默超过 idle_threshold 秒时踢掉旧会话，
++     * 让设备回到可用列表。
++     *
++     * @param busid 目标设备
++     * @param idle_threshold 判定为僵尸的静默秒数（正在传输的会话不会被抢，
++     *        否则两台客户端会互相踢）
++     * @param requester_peer 发起本次 IMPORT 的对端地址（"ip:port"）。同一个 IP
++     *        重新 attach 时旧会话必然是它自己放弃的，阈值会降到 4 秒；来自不同
++     *        IP 的连接一律按 idle_threshold 判，避免互踢。
++     * @return true 表示设备已经离开 using 列表
++     *
++     * @thread_safety 内部加锁；会等待旧会话收尾（最长约 2 秒），勿在网络线程调用
++     */
++    bool takeover_stale_session(const std::string &busid, int idle_threshold,
++                                const std::string &requester_peer = std::string());
++
++    /**
++     * [OHOS 移植补丁] 找出正在占用 busid 的会话，回填其静默秒数与对端地址。
++     * @return false 表示 using 表里没有这台设备，或找不到对应会话
++     */
++    bool find_using_session(const std::string &busid, int &idle_seconds, std::string &peer);
++
++    /**
++     * [OHOS 移植补丁] 当前导出的设备只有一台时返回它的 busid，否则返回空。
++     * 客户端缓存了过期 busid 时，用它把请求落到唯一那台设备上。
++     */
++    std::optional<std::string> single_exported_busid();
++
+     void print_devices();
+ 
+     ServerNetworkConfig network_config;
+diff --git a/include/usbipdcpp/Session.h b/include/usbipdcpp/Session.h
+index d883b5b..7d00c82 100644
+--- a/include/usbipdcpp/Session.h
++++ b/include/usbipdcpp/Session.h
+@@ -3,6 +3,8 @@
+ #include <atomic>
+ #include <unordered_map>
+ #include <shared_mutex>
++#include <cstdint>
++#include <optional>
+ 
+ #include <chrono>
+ #include <thread>
+@@ -88,6 +90,34 @@ public:
+      */
+     void immediately_stop();
+ 
++    /**
++     * [OHOS 移植补丁] 会话静默时长（秒）。
++     *
++     * 客户端掉线后有时根本不会关掉 TCP 连接（usbip-win2 把端口置错但 socket
++     * 仍被进程持有），服务端读不到 EOF、也没有任何后续流量，设备就永久卡在
++     * using 列表里；而客户端那边已经认为自己断了，开始重新 attach。Server 用
++     * 这个值判断"占用方是不是僵尸会话"，让新的 attach 直接把设备接管过去，
++     * 不需要用户停服务重开。
++     */
++    int idle_seconds();
++
++    /**
++     * @brief 本会话当前占用的 busid；还没进入传输阶段时为空
++     */
++    std::optional<std::string> imported_busid();
++
++    /**
++     * [OHOS 移植补丁] 对端地址（"ip:port"），由 Server 在 accept 之后、run()
++     * 之前写入。
++     *
++     * 用途：判断"正在占用设备的是不是这个客户端的上一条连接"。同一个 IP 重新
++     * attach 时，旧连接必然是它自己已经放弃的（Windows 侧 attach 失败后进程
++     * 常常还攥着 socket，服务端读不到 EOF），这种情况可以立刻接管；而来自
++     * 另一个 IP 的连接就不能抢，否则两台电脑会互相踢。只看空闲时长无法区分
++     * 这两种情况 —— 空闲 20 秒可能是在加载驱动，也可能是真死了。
++     */
++    std::string peer_address;
++
+     ~Session();
+ 
+     LATENCY_TRACKER_MEMBER(latency_tracker);
+@@ -159,6 +189,27 @@ private:
+ 
+     std::atomic_bool should_immediately_stop = false;
+ 
++    /** 最近一次真实数据往来的时间戳（steady_clock 毫秒），见 idle_seconds() */
++    std::atomic<std::int64_t> last_activity_ms{0};
++
++    /** 记录一次真实的数据往来（读到一条 URB 或写出一个响应） */
++    void note_activity();
++
++    /**
++     * [OHOS 移植补丁] 本会话的 URB 统计。
++     *
++     * 客户端"看起来连上了但没真的工作"时，唯一能区分原因的东西就是这些计数：
++     *   - submit 一直是 0：客户端根本没进入传输阶段（attach 没成功 / 驱动没加载）
++     *   - submit 有、unlink 也很多：客户端在等不到完成包，超时后主动取消
++     *     （服务端没把设备数据送出去，或者设备确实不响应）
++     *   - submit 有、unlink 很少：链路是通的，问题在客户端那侧
++     * 会话结束时汇总打一条 info，不进热路径。
++     */
++    std::atomic<int> urb_submit_count{0};
++    std::atomic<int> urb_unlink_count{0};
++    /** 已经打印过明细的 URB 条数（只打开头几条，见 kUrbTraceCount） */
++    std::atomic<int> urb_traced_count{0};
++
+     //是否在传输ret_submit的阶段
+     std::atomic_bool cmd_transferring = false;
+ 
 diff --git a/src/LibusbHandler/LibusbServer.cpp b/src/LibusbHandler/LibusbServer.cpp
 index fed7c8a..8430214 100644
 --- a/src/LibusbHandler/LibusbServer.cpp
@@ -69,3 +209,546 @@ index fed7c8a..8430214 100644
              }
              endpoints.push_back(std::move(alt_endpoints));
          }
+diff --git a/src/Server.cpp b/src/Server.cpp
+index ac8202c..c071598 100644
+--- a/src/Server.cpp
++++ b/src/Server.cpp
+@@ -12,6 +12,15 @@
+ #include <asio/use_awaitable.hpp>
+ #include <spdlog/spdlog.h>
+ 
++#if defined(__linux__)
++// [OHOS 移植补丁] TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT 在 netinet/tcp.h，
++// 用于给每个会话 sock 配置毫秒级的保活参数（默认值 7200s 等于没有）
++#include <netinet/tcp.h>
++#include <sys/socket.h>
++#include <cerrno>
++#include <cstring>
++#endif
++
+ #include "usbipdcpp/utils/utils.h"
+ #include "usbipdcpp/protocol.h"
+ #include "usbipdcpp/type.h"
+@@ -548,6 +557,40 @@ asio::awaitable<void> usbipdcpp::Server::accept_loop() {
+                 }
+             }
+ 
++            // [OHOS 移植补丁] TCP 保活。
++            //
++            // 客户端掉线（WiFi 抖动、PC 休眠、进程被杀、网卡切换）时，本端接收线程
++            // 挂在同步 read 上永远不会返回，也没有任何写操作去触发错误——设备于是
++            // 永久滞留在 using_devices 里。表现：客户端刷新设备列表变空，必须重启
++            // 服务才能恢复。
++            //
++            // 打开保活后，内核在 10 + 5×3 ≈ 25 秒内探测失败并让挂起的读返回错误，
++            // 会话正常收尾，设备回到可用列表。参数取得比较激进，因为这套部署是
++            // 同一局域网内的单客户端场景，慢速探测没有收益。
++            {
++                session->socket.set_option(asio::socket_base::keep_alive(true), socket_opt_ec);
++                if (socket_opt_ec) {
++                    SPDLOG_WARN("Failed to enable TCP keepalive: {}", socket_opt_ec.message());
++                }
++#if defined(__linux__)
++                int native_fd = session->socket.native_handle();
++                int idle_sec = 10;
++                int intvl_sec = 5;
++                int probes = 3;
++                if (::setsockopt(native_fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_sec, sizeof(idle_sec)) != 0) {
++                    SPDLOG_WARN("setsockopt(TCP_KEEPIDLE) failed: {}", std::strerror(errno));
++                }
++                if (::setsockopt(native_fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_sec, sizeof(intvl_sec)) != 0) {
++                    SPDLOG_WARN("setsockopt(TCP_KEEPINTVL) failed: {}", std::strerror(errno));
++                }
++                if (::setsockopt(native_fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) != 0) {
++                    SPDLOG_WARN("setsockopt(TCP_KEEPCNT) failed: {}", std::strerror(errno));
++                }
++                SPDLOG_INFO("会话 #{} 已启用 TCP 保活：空闲 {}s 开始探测，间隔 {}s，失败 {} 次判定断线",
++                            id, idle_sec, intvl_sec, probes);
++#endif
++            }
++
+             // 用 ec 版获取对端地址：客户端可能在 accept 完成后、协程继续执行
+             // 之前就已断开（尤其 RST），此时 remote_endpoint() 会抛异常。detached
+             // 协程的未捕获异常会导致 std::terminate，因此这里不能抛异常（用 ec
+@@ -560,6 +603,10 @@ asio::awaitable<void> usbipdcpp::Server::accept_loop() {
+             }
+             auto remote_endpoint_name = std::format("{}:{}", remote_endpoint.address().to_string(),
+                                                     remote_endpoint.port());
++            // [OHOS 移植补丁] 记下对端地址，供"同一个客户端重新 attach 就立刻
++            // 接管旧会话"使用（见 Server::takeover_stale_session）。必须在 run()
++            // 之前写入：run() 一启动，会话线程马上就可能处理 IMPORT。
++            session->peer_address = remote_endpoint_name;
+ 
+             // 连接过滤器（来源准入控制）：会话注册前的最后一道关，被拒的连接
+             // 直接 continue——session 出作用域即析构（关闭 socket，active_sessions
+@@ -684,19 +731,189 @@ void usbipdcpp::Server::release_device(const std::string &busid) {
+ std::shared_ptr<usbipdcpp::UsbDevice> usbipdcpp::Server::try_moving_device_to_using(const std::string &wanted_busid) {
+     std::lock_guard lock(devices_mutex);
+     //找能用的设备
++    auto matched = available_devices.end();
+     for (auto i = available_devices.begin(); i != available_devices.end(); ++i) {
+         //找到设备
+         if (wanted_busid == (*i)->busid) {
+-            SPDLOG_INFO("将{}放入正在使用的设备中", wanted_busid);
+-            //将想要的设备放入正在使用的设备
+-            auto ret = (using_devices[wanted_busid] = std::move(*i));
+-            //删掉可用设备中的这个设备
+-            available_devices.erase(i);
+-            return ret;
++            matched = i;
++            break;
++        }
++    }
++
++    // [OHOS 移植补丁] 客户端缓存了过期 busid 时的自愈。
++    //
++    // 本移植的 busid 由 `总线-设备地址:端口` 拼成，设备地址每次重新枚举都会变
++    // （鸿蒙拿不到 sysfs 拓扑，只能走这条回退分支，见 tools.h）。Windows 侧若把
++    // 上一次的 devid 存进了配置/端口，设备重新插上后它会拿着旧 busid 来 attach，
++    // 服务端找不到就回 NoDev、客户端显示「找不到 1-3 的设备」并断开。
++    //
++    // 只剩一台可导出设备时这个请求的意图是唯一确定的，直接改用它；多台时无法
++    // 判断用户要哪一台，宁可失败也不猜（否则可能把错误的设备挂给客户端）。
++    //
++    // [重要] 这里必须统计"可用 + 正在使用"的总数，不能只看 available。
++    // 之前只判 available_devices.size()==1，在"一台在用、一台空闲"的布局下会
++    // 把陌生 busid 的请求落在那台**空闲**设备上，等于把用户没点的设备挂出去。
++    if (matched == available_devices.end() &&
++        available_devices.size() + using_devices.size() == 1 &&
++        available_devices.size() == 1) {
++        matched = available_devices.begin();
++        SPDLOG_WARN("客户端请求的 busid {} 已失效，自动改用唯一可导出设备 {}", wanted_busid, (*matched)->busid);
++    }
++
++    if (matched == available_devices.end()) {
++        SPDLOG_WARN("找不到busid为{}的设备", wanted_busid);
++        return nullptr;
++    }
++
++    // 注意：此处必须用设备自身的 busid 作 using 表的键。重定向时它与
++    // wanted_busid 不同，若沿用心跳参数，后续 release_device 会因为找不到键
++    // 而失败，设备就永久卡在 using 列表里。
++    const std::string actual_busid = (*matched)->busid;
++    SPDLOG_INFO("将{}放入正在使用的设备中", actual_busid);
++    //将想要的设备放入正在使用的设备
++    auto ret = (using_devices[actual_busid] = std::move(*matched));
++    //删掉可用设备中的这个设备
++    available_devices.erase(matched);
++    return ret;
++}
++
++namespace {
++/** [OHOS 移植补丁] 只取 "ip:port" 里的 IP 部分（端口每次连接都变，不能直接比） */
++std::string PeerIpOnly(const std::string &peer) {
++    if (peer.empty()) {
++        return peer;
++    }
++    // IPv6 是 "[::1]:1234" 形式，要跳过地址内部的冒号
++    if (peer.front() == '[') {
++        auto close = peer.find("]:");
++        return close == std::string::npos ? peer : peer.substr(1, close - 1);
++    }
++    auto pos = peer.rfind(':');
++    return pos == std::string::npos ? peer : peer.substr(0, pos);
++}
++} // namespace
++
++bool usbipdcpp::Server::find_using_session(const std::string &busid, int &idle_seconds, std::string &peer) {
++    // 先把会话快照取出来，再在锁外查询：Session 内部还有自己的状态锁，
++    // 持着 session_list_mutex 去拿会话锁没有必要，也容易和收尾路径交叉
++    std::vector<std::shared_ptr<Session>> snapshot;
++    {
++        std::lock_guard lock(session_list_mutex);
++        for (auto &entry: sessions) {
++            if (auto session = entry.second.lock()) {
++                snapshot.push_back(std::move(session));
++            }
++        }
++    }
++    for (auto &session: snapshot) {
++        auto owned = session->imported_busid();
++        if (owned && *owned == busid) {
++            idle_seconds = session->idle_seconds();
++            peer = session->peer_address;
++            return true;
+         }
+     }
+-    SPDLOG_WARN("找不到busid为{}的设备", wanted_busid);
+-    return nullptr;
++    return false;
++}
++
++int usbipdcpp::Server::using_device_idle_seconds(const std::string &busid) {
++    int idle = -1;
++    std::string peer;
++    if (!find_using_session(busid, idle, peer)) {
++        return -1;
++    }
++    return idle;
++}
++
++bool usbipdcpp::Server::takeover_stale_session(const std::string &busid, int idle_threshold,
++                                               const std::string &requester_peer) {
++    std::shared_ptr<AbstDeviceHandler> handler;
++    {
++        std::lock_guard lock(devices_mutex);
++        auto it = using_devices.find(busid);
++        if (it == using_devices.end()) {
++            return false;
++        }
++        handler = it->second->handler;
++    }
++
++    int idle = -1;
++    std::string owner_peer;
++    if (!find_using_session(busid, idle, owner_peer)) {
++        // [OHOS 移植补丁] using 列表里有记录，却找不到任何持有它的会话 —— 这是
++        // 服务端侧的孤儿记录（会话对象已销毁但设备没被放回可用列表）。以前这里
++        // 直接 return false，于是客户端永远撞"设备忙"，只能停服务重开。孤儿记录
++        // 不可能有正在进行的传输，直接回收。
++        SPDLOG_WARN("设备 {} 仍在 using 列表但没有对应会话，回收孤儿记录", busid);
++        release_device(busid);
++        return true;
++    }
++
++    // [OHOS 移植补丁] 同一个客户端重新 attach 时不用等满超时。
++    //
++    // 它刚刚为这台设备建立过连接，现在又来一个——说明上一条它自己已经放弃了
++    // （Windows 侧 attach 失败/超时后，socket 常常还挂在进程里，服务端既读不到
++    // EOF 也收不到新数据）。这时如果还按"静默 45 秒才算僵尸"来判，客户端会
++    // 一直撞"设备忙"，用户只能停服务重开。
++    //
++    // 反过来，来自**不同** IP 的连接绝不能被抢：两台电脑同时在线时那样会互相
++    // 踢，谁都连不上。所以只认"同一个 IP"这一个信号，而且仍然要求它安静了
++    // 几秒（避免刚握手就被自己的另一条连接打断）。
++    int threshold = idle_threshold;
++    const std::string requester_ip = PeerIpOnly(requester_peer);
++    const std::string owner_ip = PeerIpOnly(owner_peer);
++    const bool same_client = !requester_ip.empty() && requester_ip == owner_ip;
++    if (same_client) {
++        constexpr int kSameClientIdleSeconds = 10;
++        if (threshold > kSameClientIdleSeconds) {
++            threshold = kSameClientIdleSeconds;
++        }
++    }
++
++    // 正在传输的会话绝不抢：两台客户端同时在线时会互相踢，谁都连不上。
++    if (idle < threshold) {
++        return false;
++    }
++
++    if (same_client) {
++        SPDLOG_WARN("同一个客户端({})重新 attach 设备 {}，旧会话已静默 {} 秒，直接接管",
++                    requester_ip, busid, idle);
++    }
++    else {
++        SPDLOG_WARN("设备 {} 的占用会话已静默 {} 秒（来自 {}），判定为僵尸会话，接管给 {}",
++                    busid, idle, owner_ip.empty() ? "未知" : owner_ip,
++                    requester_ip.empty() ? "新连接" : requester_ip);
++    }
++    if (handler) {
++        // 只停止会话，不标记设备已移除：收尾时 release_device 会把设备放回
++        // 可用列表，接下来的导入流程才能真正拿到它
++        handler->trigger_session_stop();
++    }
++
++    // 会话收尾在它自己的线程上异步进行，等设备真的回到可用列表
++    for (int i = 0; i < 80; ++i) {
++        {
++            std::shared_lock lock(devices_mutex);
++            if (!using_devices.contains(busid)) {
++                SPDLOG_INFO("僵尸会话已释放 {}，设备回到可用列表", busid);
++                return true;
++            }
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(25));
++    }
++    SPDLOG_WARN("接管 {} 超时：设备仍在 using 列表", busid);
++    return false;
++}
++
++std::optional<std::string> usbipdcpp::Server::single_exported_busid() {
++    std::shared_lock lock(devices_mutex);
++    if (available_devices.size() + using_devices.size() != 1) {
++        return std::nullopt;
++    }
++    if (!available_devices.empty()) {
++        return available_devices.front()->busid;
++    }
++    return using_devices.begin()->first;
+ }
+ 
+ void usbipdcpp::Server::print_devices() {
+diff --git a/src/Session.cpp b/src/Session.cpp
+index 38a7ebd..aeb4408 100644
+--- a/src/Session.cpp
++++ b/src/Session.cpp
+@@ -20,8 +20,56 @@
+ #include "usbipdcpp/network.h"
+ #include "usbipdcpp/protocol.h"
+ 
++namespace {
++// [OHOS 移植补丁] 占用方静默多久就判定为僵尸会话（秒）。
++//
++// 这个值必须**大于客户端的正常空闲时间**。早期取 6 秒是错的：Windows 侧
++// attach 成功之后要加载驱动、PnP 管理器还要初始化，这中间十几秒完全没有
++// URB 往来是很正常的；更不用说设备本身空闲（加密狗、待机串口、HID）。
++// 一旦误判，僵尸接管会把刚建好、正在正常工作的会话踢掉，客户端只好重新
++// attach，形成"连上→被踢→重连"的死循环，表现就是"看起来连上了但用不了"。
++//
++// 真正死掉的连接不靠这里兜底：accept 时已经开了 TCP keepalive
++// （10s 空闲 + 5s×3 探测 ≈ 25s 内内核判死），socket 一错会话就自己收尾。
++// 这里只是 keepalive 之外的第二道保险，所以取 45 秒。
++constexpr int kIdleTakeoverSeconds = 45;
++
++// [OHOS 移植补丁] 每个会话打印前多少条 URB 明细。
++// 排查"客户端到底有没有在说话"必须看得到具体的端点/方向/长度；
++// 全量打会刷屏（接口跑起来每秒几百条），只打开头这一段足够。
++constexpr int kUrbTraceCount = 12;
++}
++
+ usbipdcpp::Session::Session(Server &server, std::uint64_t id) :
+     server(server), id(id) {
++    // 会话一建立就算"刚活跃过"：客户端 attach 之后可能立刻进入空闲，
++    // 不能让它一上来就被当成僵尸会话
++    note_activity();
++}
++
++namespace {
++std::int64_t steady_now_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++}
++
++void usbipdcpp::Session::note_activity() {
++    last_activity_ms.store(steady_now_ms(), std::memory_order_relaxed);
++}
++
++int usbipdcpp::Session::idle_seconds() {
++    const auto last = last_activity_ms.load(std::memory_order_relaxed);
++    if (last <= 0) {
++        return 0;
++    }
++    const auto elapsed = steady_now_ms() - last;
++    return elapsed <= 0 ? 0 : static_cast<int>(elapsed / 1000);
++}
++
++std::optional<std::string> usbipdcpp::Session::imported_busid() {
++    std::shared_lock lock(current_import_device_data_mutex);
++    return current_import_device_id;
+ }
+ 
+ void usbipdcpp::Session::enqueue_ret_submit(UsbIpResponse::UsbIpRetSubmit &&submit) {
+@@ -138,6 +186,19 @@ void usbipdcpp::Session::parse_op() {
+                         std::shared_lock lock(server.devices_mutex);
+                         to_be_sent =
+                                 UsbIpResponse::OpRepDevlist::create_from_devices(server.available_devices).to_bytes();
++                        // [OHOS 移植补丁] 把回包内容记下来。客户端 attach 时会先
++                        // 拉一次列表、再按列表里的 busid 发 IMPORT；一旦它请求的
++                        // busid 和这里发出去的任何一个都不一样，就说明是客户端
++                        // 自己在缓存/编造 busid，服务端怎么改都匹配不上。
++                        std::string ids;
++                        for (const auto &dev: server.available_devices) {
++                            if (!ids.empty()) {
++                                ids += ",";
++                            }
++                            ids += dev->busid;
++                        }
++                        SPDLOG_INFO("[设备列表] 回复 {} 台: {}", server.available_devices.size(),
++                                    ids.empty() ? "（空）" : ids);
+                     }
+                     asio::write(socket, asio::buffer(to_be_sent), ec);
+                     if (!ec) [[likely]]
+@@ -155,8 +216,65 @@ void usbipdcpp::Session::parse_op() {
+                     UsbIpResponse::OpRepImport op_rep_import{};
+                     SPDLOG_TRACE("客户端想连接busid为 {} 的设备", wanted_busid);
+ 
++                    // [OHOS 移植补丁] 每次 IMPORT 都把"它要什么 / 我有什么"打出来。
++                    // 客户端 attach 失败时这是唯一能对齐两条信息的地方：
++                    //   - 它要的 busid 在我列表里 → 我这边处理有问题
++                    //   - 它要的 busid 不在列表里 → 客户端缓存了过期 busid（或自己编的）
++                    {
++                        std::shared_lock diag_lock(server.devices_mutex);
++                        std::string ids;
++                        for (const auto &dev: server.available_devices) {
++                            if (!ids.empty()) {
++                                ids += ",";
++                            }
++                            ids += dev->busid;
++                        }
++                        for (const auto &entry: server.using_devices) {
++                            if (!ids.empty()) {
++                                ids += ",";
++                            }
++                            ids += entry.first;
++                            ids += "(占用中)";
++                        }
++                        SPDLOG_INFO("[导入] 客户端请求 busid={} | 现有导出: {}", wanted_busid,
++                                    ids.empty() ? "无" : ids);
++                    }
++
+                     bool target_device_is_using = false;
+                     bool open_device_failed = false;
++                    // [OHOS 移植补丁] 真正被占用的 busid。服务端在只剩一台可导出设备
++                    // 时会把过期 busid 重定向到它（见 Server::try_moving_device_to_using），
++                    // 此时它与客户端请求的 wanted_busid 不同，后续 using 表的增删都必须
++                    // 用这个值，否则释放时找不到键，设备会永久卡在 using 列表里。
++                    std::string actual_busid;
++
++                    // [OHOS 移植补丁] 这里只处理"真正的重连"，绝不做"顺手接管"。
++                    //
++                    // 以前的写法是：请求的 busid 对不上任何记录时，只要本机只剩一台
++                    // 可导出设备，就把它当成"客户端缓存了旧 busid"，直接接管那台设备。
++                    // 这个兜底看着聪明，实际是自伤：
++                    //
++                    //   usbip-win2 的 UDE 驱动会把 attach 过的设备记进注册表
++                    //   PersistentDevices，并在**驱动重新加载**或**后台无限重试**时，
++                    //   拿着当时存的 busid 重新发起 attach（重试间隔最长 30 分钟）。
++                    //   鸿蒙这边设备地址一变（1-3 → 1-2），那条后台重试就永远对不上，
++                    //   于是它每隔一段时间就来敲一次门——而旧代码每次都把这当成
++                    //   "重连"，把用户正在正常传输的会话踢掉。用户看到的就是
++                    //   "连上了，突然又被一个不存在的 busid 顶掉"。
++                    //
++                    // 现在的规则很简单：
++                    //   · 请求的 busid 正是当前被占用的那台 → 才可能是同一次重连，检查僵尸；
++                    //   · 请求陌生 busid → 只回错误，不触碰任何现有会话。
++                    if (server.is_device_using(wanted_busid)) {
++                        server.takeover_stale_session(wanted_busid, kIdleTakeoverSeconds, peer_address);
++                    }
++                    else if (auto only = server.single_exported_busid();
++                             only && *only != wanted_busid && server.is_device_using(*only)) {
++                        SPDLOG_WARN("[导入] 拒绝：客户端请求了从未导出的 busid={}，而唯一设备 {} 正在使用中。"
++                                    "该请求不影响现有会话（多半是 PC 端 PersistentDevices 里的旧记录在重试）",
++                                    wanted_busid, *only);
++                    }
++
+                     // 已经在使用的不支持导出
+                     if (server.is_device_using(wanted_busid)) {
+                         spdlog::warn("正在使用的设备不支持导出");
+@@ -170,7 +288,8 @@ void usbipdcpp::Session::parse_op() {
+                         if (auto using_device = server.try_moving_device_to_using(wanted_busid)) {
+                             std::lock_guard lock(current_import_device_data_mutex);
+                             spdlog::info("成功将设备放入正在使用的设备中");
+-                            current_import_device_id = wanted_busid;
++                            actual_busid = using_device->busid;
++                            current_import_device_id = actual_busid;
+                             // 将当前使用的设备指向这个设备
+                             current_import_device = using_device;
+                             current_handler = using_device->handler;
+@@ -183,7 +302,7 @@ void usbipdcpp::Session::parse_op() {
+                                 SPDLOG_ERROR("打开设备失败: {}", open_ec.message());
+                                 open_device_failed = true;
+                                 // 释放设备（已被物理移除的由 Server 直接丢弃）
+-                                server.release_device(wanted_busid);
++                                server.release_device(actual_busid);
+                                 current_import_device.reset();
+                                 current_handler.reset();
+                                 current_import_device_id.reset();
+@@ -200,6 +319,7 @@ void usbipdcpp::Session::parse_op() {
+                                 op_rep_import = UsbIpResponse::OpRepImport::create_on_success(current_import_device);
+                                 cmd_transferring = true;
+                                 imported = true;
++                                actual_busid = current_import_device->busid;
+                             }
+                             else {
+                                 spdlog::info("不存在目标设备，不可导入");
+@@ -209,9 +329,14 @@ void usbipdcpp::Session::parse_op() {
+                         }
+                         if (imported) {
+                             // 通知在锁外发出：回调里可以安全调用 Server 的查询接口
+-                            // （见 ServerObserver 注释）；当前导入的 busid 必然是
+-                            // wanted_busid（try_moving_device_to_using 成功时已记入）
+-                            server.notify_device_attached(wanted_busid);
++                            // （见 ServerObserver 注释）。用 actual_busid 而不是
++                            // wanted_busid：过期 busid 被重定向时二者不同，日志和
++                            // 观察者事件必须以真实设备为准
++                            if (actual_busid != wanted_busid) {
++                                spdlog::warn("客户端请求 {} 已重定向到 {}，本次会话使用后者",
++                                             wanted_busid, actual_busid);
++                            }
++                            server.notify_device_attached(actual_busid);
+                         }
+                     }
+                     else if (open_device_failed) {
+@@ -459,6 +584,13 @@ void usbipdcpp::Session::transfer_loop(usbipdcpp::error_code &transferring_ec) {
+     sender_thread.join();
+     SPDLOG_INFO("sender thread退出");
+ 
++    // [OHOS 移植补丁] 会话级汇总。判断"客户端是不是真的在搬数据"只看这一行：
++    //   提交 0 条      → 客户端没进入传输阶段（attach 没成功 / 驱动没起来）
++    //   取消占比很高   → 客户端等不到完成包，超时后主动放弃（链路/设备不响应）
++    //   提交多、取消少 → 链路是好的，问题在客户端那侧
++    SPDLOG_INFO("本会话 URB 统计: 提交 {} 条, 被客户端取消 {} 条", urb_submit_count.load(),
++                urb_unlink_count.load());
++
+     // 在 handler 存活时清空队列，确保 TransferHandle 析构时 handler 仍有效
+     write_buffer.clear();
+     read_buffer.clear();
+@@ -475,7 +607,10 @@ void usbipdcpp::Session::transfer_loop(usbipdcpp::error_code &transferring_ec) {
+         auto is_disconnect = receiver_ec == make_error_code(ErrorType::SOCKET_EOF) ||
+                              receiver_ec == make_error_code(ErrorType::SOCKET_ERR);
+         if (is_disconnect) {
+-            SPDLOG_DEBUG("连接断开：{}", receiver_ec.message());
++            // [OHOS 移植补丁] 升到 info：这条是"设备为什么会掉"的唯一线索，
++            // 客户端主动 detach 与对端掉线（WiFi 抖动 / TCP 保活探测失败）
++            // 都走这里。每个会话最多一条，不构成噪声。
++            SPDLOG_INFO("连接已断开（客户端 detach 或对端掉线）: {}", receiver_ec.message());
+         }
+         else {
+             SPDLOG_ERROR("An error occur during receiving: {}", receiver_ec.message());
+@@ -529,6 +664,9 @@ void usbipdcpp::Session::receiver(usbipdcpp::error_code &receiver_ec) {
+         }
+         if (should_immediately_stop) [[unlikely]]
+             break;
++        // [OHOS 移植补丁] 读到完整一条命令就算一次活跃：Server 靠它区分
++        // "客户端在正常使用（设备空闲但连接活着）"和"客户端早就没了"
++        note_activity();
+         std::visit(
+                 [&, this](auto &&cmd) {
+                     using T = std::remove_cvref_t<decltype(cmd)>;
+@@ -541,6 +679,23 @@ void usbipdcpp::Session::receiver(usbipdcpp::error_code &receiver_ec) {
+                         std::uint8_t real_ep = out ? static_cast<std::uint8_t>(cmd2.header.ep)
+                                                    : (static_cast<std::uint8_t>(cmd2.header.ep) | 0x80);
+                         SPDLOG_TRACE("传输的真实端口为 {:02x}", real_ep);
++                        // [OHOS 移植补丁] 统计 + 会话开头几条明细。
++                        // 这几行是判断"客户端到底有没有在搬数据"的唯一依据：
++                        // submit=0 说明它压根没进入传输阶段，unlink 多说明它在
++                        // 等不到完成包后主动放弃。
++                        const int submit_no = urb_submit_count.fetch_add(1, std::memory_order_relaxed) + 1;
++                        if (urb_traced_count.fetch_add(1, std::memory_order_relaxed) < kUrbTraceCount) {
++                            SPDLOG_INFO("[URB] #{} seq={} ep=0x{:02x} {} len={} setup={:02x}{:02x} wValue={:04x}"
++                                        " wIndex={:04x} wLength={} flags=0x{:08x}",
++                                        submit_no, cmd2.header.seqnum, real_ep, out ? "OUT" : "IN",
++                                        cmd2.transfer_buffer_length,
++                                        static_cast<int>(cmd2.setup.request_type),
++                                        static_cast<int>(cmd2.setup.request),
++                                        static_cast<int>(cmd2.setup.value),
++                                        static_cast<int>(cmd2.setup.index),
++                                        static_cast<int>(cmd2.setup.length),
++                                        cmd2.transfer_flags);
++                        }
+                         [[maybe_unused]] auto current_seqnum = cmd2.header.seqnum;
+ 
+                         auto ep_find_ret = current_import_device->find_ep(real_ep);
+@@ -578,6 +733,8 @@ void usbipdcpp::Session::receiver(usbipdcpp::error_code &receiver_ec) {
+                     else if constexpr (std::is_same_v<UsbIpCommand::UsbIpCmdUnlink, T>) {
+                         UsbIpCommand::UsbIpCmdUnlink &cmd2 = cmd;
+                         SPDLOG_TRACE("收到 UsbIpCmdUnlink 包，序列号: {}", cmd2.header.seqnum);
++                        // [OHOS 移植补丁] 计数：unlink 多说明客户端在等不到完成包
++                        urb_unlink_count.fetch_add(1, std::memory_order_relaxed);
+ 
+                         current_handler->handle_unlink_seqnum(cmd2.unlink_seqnum, cmd2.header.seqnum);
+                     }
+@@ -680,6 +837,11 @@ void usbipdcpp::Session::sender(usbipdcpp::error_code &ec) {
+                 },
+                 send_data);
+ 
++        // [OHOS 移植补丁] 写出一个响应也算活跃，理由同 receiver 里的 note_activity
++        if (!sending_ec) {
++            note_activity();
++        }
++
+         if (sending_ec) {
+             // TCP 写入失败，立即关闭 session 双向通信。
+             // 仅 break 退出 sender 不会让 receiver 退出：它挂在同步读上，而连接没有
