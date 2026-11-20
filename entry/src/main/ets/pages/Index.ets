@@ -8,6 +8,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
+import { bundleManager } from '@kit.AbilityKit';
 import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
 import { SharedDevice, UsbDeviceService } from '../usbip/UsbDeviceService';
 import { keepAlive, KeepAliveState } from '../usbip/KeepAlive';
@@ -105,8 +106,13 @@ struct Index {
   private boundByIdentity: Map<string, string> = new Map();
   /** stableBusid 的异常只报一次，避免刷屏 */
   private stableWarned: boolean = false;
+  /** 版本串缓存，见 buildLabel() */
+  private versionText: string = '';
 
   aboutToAppear(): void {
+    // 先把包版本打出来。排查时最怕的情况是"代码改了、装上去的还是旧包"，
+    // 有这行就能立刻分辨：日志里的版本号必须和最新构建一致。
+    this.appendLog(`[版本] ${this.buildLabel()}`, LOG_INFO);
     const ok: boolean = usbipNative.init();
     this.appendLog(ok ? '[native] libusb 初始化成功' : '[native] libusb 初始化失败',
       ok ? LOG_INFO : LOG_ERROR);
@@ -274,6 +280,28 @@ struct Index {
    * 界面判断"是否已共享"只认这个结果，不靠自己记账 —— 记账一旦漏一次，
    * 开关就会显示成关闭而服务端其实还导出着，用户再点一下必然撞 busid。
    */
+  /**
+   * 当前包的版本串（versionName + versionCode），启动时写进日志。
+   *
+   * 用途只有一个：确认手机里跑的确实是最新构建。曾出现过改完代码重新打包、
+   * 装上去却还是旧逻辑的情况（同 versionCode 覆盖安装被系统挡掉），
+   * 光看日志无法分辨，白排查一轮。
+   */
+  private buildLabel(): string {
+    if (this.versionText.length > 0) {
+      return this.versionText;
+    }
+    try {
+      const info: bundleManager.BundleInfo =
+        bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      this.versionText = `v${info.versionName} (code ${info.versionCode})`;
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'getBundleInfo failed: %{public}s', JSON.stringify(err));
+      this.versionText = '未知版本';
+    }
+    return this.versionText;
+  }
+
   private matchBusid(head: string, parts: string[]): string {
     if (head.length === 0) {
       return '';
@@ -296,8 +324,7 @@ struct Index {
    * 这是「同一个设备拔插后 busid 就变」的根治办法：设备地址是系统临时分配的
    * 座位号，不能当身份证用。
    */
-  private stableBusidOf(d: SharedDevice): string {
-    try {
+  private stableBusidOf(d: SharedDevice): string {    try {
       const s: string = usbipNative.stableBusid(d.busNum, d.vendorId, d.productId, d.serial, d.product);
       if (s.length === 0 && !this.stableWarned) {
         this.stableWarned = true;
@@ -458,7 +485,8 @@ struct Index {
       const rounds: number = prev === undefined ? 1 : prev + 1;
       if (rounds < 2) {
         nextRounds.set(busid, rounds);
-        this.appendLog(`[孤儿] ${busid} 对不上任何在线设备（第 ${rounds}/2 轮确认）`, LOG_WARN);
+        this.appendLog(`[孤儿] ${busid} 对不上任何在线设备（第 ${rounds}/2 轮确认）`
+          + ` 在线可认领=[${alive.join(',')}]`, LOG_WARN);
         continue;
       }
       const code: number = usbipNative.notifyDeviceRemoved(busid);
@@ -584,6 +612,7 @@ struct Index {
     const lines: string[] = [];
     lines.push('===== HarmonyOS USB/IP 调试日志 =====');
     lines.push(`导出时间 ${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()} ${this.stamp()}`);
+    lines.push(`包版本 ${this.buildLabel()}`);
     lines.push(`服务状态 ${this.running ? '运行中' : '已停止'} 端口=${this.portText}`
       + ` 保活=${this.keepAliveActive ? '生效' : this.keepAliveText}`);
     lines.push(`当前设备 ${this.devices.length} 台：`);
@@ -1029,6 +1058,10 @@ struct Index {
         Text('设备共享服务')
           .fontSize(13)
           .fontColor(C_LABEL2)
+        // 版本水印：排查时第一眼看这里，就能确认跑的是不是最新构建
+        Text(this.buildLabel())
+          .fontSize(11)
+          .fontColor(C_LABEL3)
       }
       .alignItems(HorizontalAlign.Start)
 

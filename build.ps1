@@ -45,6 +45,24 @@ if (Test-Path $JavaExe) {
 }
 
 $Hvigor = Join-Path $Tools 'bin\hvigorw.bat'
+
+# Bump versionCode/versionName on every build.
+# Reason: installing a HAP whose versionCode is not newer than the installed
+# one can be rejected (or silently keep the old APK-like payload on device),
+# which makes us debug code that is not even running. The UI prints
+# "v<versionName> (code <versionCode>)" at startup, so a mismatch is visible.
+$AppJson = Join-Path $Project 'AppScope\app.json5'
+if (Test-Path $AppJson) {
+    $stamp = Get-Date
+    $vcode = 1000000 + [int]$stamp.ToString('MMddHHmm')
+    $vname = '1.0.' + $stamp.ToString('MMdd.HHmm')
+    $text = [System.IO.File]::ReadAllText($AppJson)
+    $text = [regex]::Replace($text, '"versionCode"\s*:\s*\d+', ('"versionCode": ' + $vcode))
+    $text = [regex]::Replace($text, '"versionName"\s*:\s*"[^"]*"', ('"versionName": "' + $vname + '"'))
+    [System.IO.File]::WriteAllText($AppJson, $text, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "==> version : $vname (code $vcode)"
+}
+
 $HvArgs = @(
     'assembleHap',
     '--mode', 'module',
