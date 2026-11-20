@@ -87,6 +87,13 @@ struct Index {
   private lastDumpAt: number = 0;
   /** busid → 连续几轮没有对应在线设备（孤儿导出记录去抖） */
   private orphanRounds: Map<string, number> = new Map();
+  /**
+   * busid → 绑定成功的时刻。
+   *
+   * 刚绑完的那两秒里，系统枚举经常短暂缺项（connectDevice 会重新枚举），
+   * 此时"对不上任何在线设备"是正常现象，不能当成孤儿摘掉。
+   */
+  private boundAt: Map<string, number> = new Map();
   /** name → 上次开关动作的时间戳；600ms 内不接受第二次操作，见 setShared */
   private lastActionAt: Map<string, number> = new Map();
   /**
@@ -368,11 +375,19 @@ struct Index {
    *
    * 这是第二阶段兜底：pruneGhosts 靠 fd 探测，能发现"设备没了但句柄还开着"；
    * 但如果某次绑定失败、或设备在两次绑定之间换过地址，服务端也可能留下一条
-   * 从来没被探到的记录（比如 handler 里 native_handle 为空）。这类记录的特征
-   * 很明确：busid 前缀 `总线-地址` 不在当前枚举结果里。
+   * 从来没被探到的记录（比如 handler 里 native_handle 为空）。
    *
-   * 去抖 2 轮（约 4 秒）：requestRight/connectDevice 期间 getDevices() 会短暂
-   * 缺项，一轮就摘会把正在用的导出踢掉，客户端立刻断。
+   * ── 这里踩过一个大坑，务必看清 ──
+   * 老实现是拿 busid 前缀 `总线-地址` 去比当前枚举结果的 `总线-地址`。busid 改成
+   * 设备身份指纹（`1-33897`）之后，这个比较永远不成立，于是**刚从服务端确认绑定
+   * 成功的记录会在 2 秒后被自己摘掉**：日志里表现为
+   *   [绑定] 1-2 → busid=1-33897
+   *   [孤儿] 1-33897 对不上任何在线设备
+   * 用户看到的就是"点一下开关就弹回去、然后连不上"。
+   *
+   * 正确判定：一条导出记录只要能被**任何一台在线设备**认领，就不是孤儿。
+   * 认领依据依次是：native 亲口返回的 busid、按设备身份推导的稳定 busid、
+   * 以及旧的临时地址候选。另外刚绑定 6 秒内的记录一律不摘（枚举抖动期）。
    *
    * @returns 是否摘掉过记录
    */
@@ -385,35 +400,58 @@ struct Index {
       // 授权/连接过程中枚举会抖动，这段时间不做任何判断
       return false;
     }
-    const present: string[] = [];
-    for (let i = 0; i < this.devices.length; i++) {
-      const d: SharedDevice = this.devices[i];
-      if (d.busNum <= 0) {
-        // 拿不到总线号时前缀构造不出来（会变成 0-0），此时任何比较都不可信
-        return false;
-      }
-      present.push(`${d.busNum}-${d.devAddress}`);
-    }
     const bound: string = this.boundBusids();
     if (bound.length === 0) {
       this.orphanRounds.clear();
       return false;
     }
-    if (present.length === 0) {
+    if (this.devices.length === 0) {
       // 列表偶尔会整轮返回空（系统正切 USB 状态），此时不能判定"全部失效"
       return false;
     }
 
+    // 在线设备能合法认领的所有 busid 前缀
+    const alive: string[] = [];
+    for (let i = 0; i < this.devices.length; i++) {
+      const d: SharedDevice = this.devices[i];
+      const stable: string = this.stableBusidOf(d);
+      if (stable.length > 0) {
+        alive.push(this.busidHead(stable));
+      }
+      const cached: string = this.boundByIdentity.get(d.identity()) ?? '';
+      if (cached.length > 0) {
+        alive.push(this.busidHead(cached));
+      }
+      if (stable.length === 0 && cached.length === 0) {
+        // 这台设备既算不出稳定 busid、也没有绑定记录：它可能正持有一条我们
+        // 认不出来的导出记录（比如上一版留下的稳定 busid）。这种情况下任何
+        // "对不上" 的结论都不可信，整轮放弃判定。
+        return false;
+      }
+      const cands: string[] = d.busidCandidates();
+      for (let c = 0; c < cands.length; c++) {
+        alive.push(this.busidHead(cands[c]));
+      }
+      if (d.busNum > 0) {
+        alive.push(`${d.busNum}-${d.devAddress}`);
+      }
+    }
+
     const parts: string[] = bound.split('|');
     const nextRounds: Map<string, number> = new Map();
+    const now: number = Date.now();
     let reaped: boolean = false;
     for (let i = 0; i < parts.length; i++) {
       const busid: string = parts[i];
       if (busid.length === 0) {
         continue;
       }
-      const head: string = this.busidHead(busid);
-      if (present.indexOf(head) >= 0) {
+      if (alive.indexOf(this.busidHead(busid)) >= 0) {
+        continue;
+      }
+      // 刚绑上的记录先放过：枚举抖动期对不上是常态
+      const at: number | undefined = this.boundAt.get(busid);
+      if (at !== undefined && now - at < 6000) {
         continue;
       }
       const prev: number | undefined = this.orphanRounds.get(busid);
@@ -425,6 +463,7 @@ struct Index {
       }
       const code: number = usbipNative.notifyDeviceRemoved(busid);
       this.appendLog(`[孤儿] ${busid} 已确认失效，摘除 code=${code}`, LOG_WARN);
+      this.boundAt.delete(busid);
       reaped = true;
     }
     this.orphanRounds = nextRounds;
@@ -785,6 +824,8 @@ struct Index {
       device.busid = usbipNative.getLastBusid();
       // 记下地面真相：开关状态以后就按它来匹配，不再依赖任何推导
       this.boundByIdentity.set(device.identity(), device.busid);
+      // 记下绑定时刻：刚绑上的 6 秒内不参与孤儿判定（枚举会短暂缺项）
+      this.boundAt.set(device.busid, Date.now());
       this.appendLog(`[绑定] ${device.name} → busid=${device.busid}`, LOG_OK);
       // 自检：刚绑上就查一遍服务端导出列表，对不上说明界面和 native 的
       // busid 口径已经分叉了 —— 这种问题不报出来，表现就是"开关自己弹回去"
@@ -843,6 +884,7 @@ struct Index {
       : `[解绑] ${device.name} 失败 code=${code}`, code === 0 ? LOG_OK : LOG_ERROR);
     if (code === 0) {
       this.boundByIdentity.delete(device.identity());
+      this.boundAt.delete(busid);
     }
     this.service.closeDevice(device.name);
     device.shared = false;
