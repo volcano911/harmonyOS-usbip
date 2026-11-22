@@ -24,10 +24,20 @@ import { BusinessError } from '@kit.BasicServicesKit';
 const DOMAIN = 0x3200;
 const TAG = 'UsbIpKeepAlive';
 
-/** 被系统取消后自动重启的最大次数，避免无意义地反复撞墙 */
-const MAX_AUTO_RESTART: number = 3;
-/** 重启前的等待，太急会被系统判定为骚扰 */
+/**
+ * 被系统取消后自动重启的最大次数。
+ *
+ * 原来是 3。但"用久了十几二十分钟突然连不上"最典型的成因就是长时任务被系统
+ * 取消（内存管控、判定没有真实数据传输），进程随后被冻结，native 的 socket
+ * 与 USB 事件循环一起停摆 —— 客户端看到的就是连接毫无征兆地断掉。3 次在
+ * 一次稍微长的调试会话里根本不够用（用户往往几小时不碰前台），提到 8 次，
+ * 配合退避大约能覆盖十分钟以上的反复取消。
+ */
+const MAX_AUTO_RESTART: number = 8;
+/** 首次重启等待；之后按次数退避，见 tryAutoRestart */
 const RESTART_DELAY_MS: number = 3000;
+/** 退避上限：再慢就不如直接提示用户回前台了 */
+const RESTART_DELAY_MAX_MS: number = 30000;
 
 export interface KeepAliveState {
   active: boolean;
@@ -187,17 +197,21 @@ export class KeepAlive {
       return;
     }
     this.restartCount++;
-    hilog.info(DOMAIN, TAG, 'auto restart continuous task, attempt %{public}d', this.restartCount);
+    // 退避：3s、6s、9s…最多 30s。第一次尽快（用户可能马上就发现断了），
+    // 之后放慢，避免连续撞上系统的同一个管控策略。
+    const delay: number = Math.min(RESTART_DELAY_MAX_MS, RESTART_DELAY_MS * this.restartCount);
+    hilog.info(DOMAIN, TAG, 'auto restart continuous task, attempt %{public}d, delay %{public}dms',
+      this.restartCount, delay);
     setTimeout(() => {
       if (this.active) {
         return;
       }
       this.start(ctx).then((ok: boolean) => {
         if (!ok) {
-          this.emit(false, `${why}；自动恢复失败，请回前台手动重启`);
+          this.emit(false, `${why}；第 ${this.restartCount} 次自动恢复失败，稍后继续尝试`);
         }
       });
-    }, RESTART_DELAY_MS);
+    }, delay);
   }
 
   private explain(code: number): string {

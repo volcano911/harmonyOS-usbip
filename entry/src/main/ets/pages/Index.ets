@@ -677,7 +677,10 @@ struct Index {
       return false;
     }
     const now: number = Date.now();
-    if (now - this.lastPruneAt < 3000) {
+    // 3 秒太密：探测会在 native 侧持全局锁做控制传输（每个设备最多 100ms），
+    // 每 3 秒来一次会和界面的状态查询抢锁，长时间运行后表现为卡顿。而且
+    // available 设备的 fd 失效并不紧急——没人用它。10 秒足够。
+    if (now - this.lastPruneAt < 10000) {
       return false;
     }
     this.lastPruneAt = now;
@@ -839,7 +842,27 @@ struct Index {
       }
       const want: string = this.stableBusidOf(device);
       this.appendLog(`[打开] ${device.name} fd=${fd} 稳定 busid=${want}（临时地址 ${device.busNum}-${device.devAddress}）`, LOG_INFO);
-      const code: number = usbipNative.bindDevice(fd, want);
+      let code: number = usbipNative.bindDevice(fd, want);
+
+      // [稳定性] fd 失效后的自愈重试。
+      //
+      // 设备长时间插着不动的时候，USB 栈可能被系统重置（省电策略、USB 服务
+      // 重启、供电波动），此时旧的 usbfs fd 已经失效，而 usbManager 给出的
+      // name 不会变 —— openDevice() 命中缓存直接把死 fd 交回来，绑定必然失败。
+      // 以前这里直接放弃，用户只能拔插一次才能恢复，表现就是"断了一次之后
+      // 怎么连都连不上"。这类错误码全都是"句柄不可用"，重开一次就能好。
+      if (code !== 0 && this.shouldReopenFd(code)) {
+        this.appendLog(`[绑定] ${device.name} 失败 code=${code}${this.explainBindCode(code)}，重建句柄后重试`, LOG_WARN);
+        this.service.closeDevice(device.name);
+        const again: number = await this.service.openDevice(device.name);
+        if (again >= 0) {
+          fd = again;
+          code = usbipNative.bindDevice(again, want);
+          this.appendLog(`[绑定] ${device.name} 重试${code === 0 ? '成功' : `仍失败 code=${code}`} fd=${again}`,
+            code === 0 ? LOG_OK : LOG_ERROR);
+        }
+      }
+
       if (code !== 0) {
         this.service.closeDevice(device.name);
         this.appendLog(`[绑定] ${device.name} 失败 code=${code}${this.explainBindCode(code)}`, LOG_ERROR);
@@ -873,9 +896,16 @@ struct Index {
     }
   }
 
+  /**
+   * 这些错误码的共同点：**手上的 fd 已经不可用了**，而不是"服务端不让绑"。
+   * 重建一次句柄有实质意义；其余（已导出、设备忙）重试只会白撞。
+   */
+  private shouldReopenFd(code: number): boolean {
+    return code === 1 || code === 3 || code === 4 || code === 5 || code === 6;
+  }
+
   /** 绑定错误码的人话解释，省得每次还要翻源码 */
-  private explainBindCode(code: number): string {
-    switch (code) {
+  private explainBindCode(code: number): string {    switch (code) {
       case 1: return '（设备未找到）';
       case 2: return '（设备正在被客户端使用）';
       case 3: return '（打开 fd 失败）';

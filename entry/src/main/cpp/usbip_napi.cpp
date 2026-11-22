@@ -20,12 +20,15 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <dirent.h>
 
 #include <libusb-1.0/libusb.h>
 #include <spdlog/spdlog.h>
@@ -68,6 +71,58 @@ bool g_running = false;
 int g_port = -1;
 std::string g_last_busid;
 napi_threadsafe_function g_log_tsfn = nullptr;
+/** 服务启动时刻，用于健康监控里报告运行时长 */
+std::chrono::steady_clock::time_point g_started_at{};
+
+/**
+ * 数 /proc/self/<sub> 下的条目（fd、线程）。读不到返回 -1。
+ *
+ * 为什么要专门做这个：用户反馈"用久了十几二十分钟就不行"，这类问题只有两种
+ * 成因——要么资源单调增长（线程/fd 泄漏），要么进程被系统冻结（长时任务被
+ * 取消）。两者在日志里的表现完全不同，没有这几个数就只能猜。
+ */
+int CountProcEntries(const char *sub) {
+    const std::string path = std::string("/proc/self/") + sub;
+    DIR *dir = opendir(path.c_str());
+    if (dir == nullptr) {
+        return -1;
+    }
+    int n = 0;
+    while (struct dirent *ent = readdir(dir)) {
+        if (ent->d_name[0] != '.') {
+            ++n;
+        }
+    }
+    closedir(dir);
+    return n;
+}
+
+/** 当前进程 RSS（KB），读不到返回 -1 */
+int ReadVmRssKb() {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (f == nullptr) {
+        return -1;
+    }
+    char line[256];
+    int kb = -1;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (std::strncmp(line, "VmRSS:", 6) == 0) {
+            std::sscanf(line + 6, "%d", &kb);
+            break;
+        }
+    }
+    fclose(f);
+    return kb;
+}
+
+/** 服务已运行的分钟数（未启动返回 0） */
+long UptimeMinutes() {
+    if (g_started_at.time_since_epoch().count() == 0) {
+        return 0;
+    }
+    const auto d = std::chrono::steady_clock::now() - g_started_at;
+    return static_cast<long>(std::chrono::duration_cast<std::chrono::minutes>(d).count());
+}
 
 const char *ReleaseReasonText(usbipdcpp::DeviceReleaseReason reason) {
     switch (reason) {
@@ -635,6 +690,7 @@ napi_value StartServer(napi_env env, napi_callback_info info) {
         }
         g_running = true;
         g_port = g_server->get_server().endpoint().port();
+        g_started_at = std::chrono::steady_clock::now();
         spdlog::info("服务已启动，监听端口 {}", g_port);
         return MakeInt(env, g_port);
     } catch (const std::exception &e) {
@@ -671,6 +727,7 @@ napi_value StopServer(napi_env env, napi_callback_info /*info*/) {
             g_server.reset();
         }
         g_running = false;
+        g_started_at = {};
         spdlog::info("服务已停止");
     } catch (const std::exception &e) {
         LOGE("stopServer threw: %{public}s", e.what());
@@ -810,10 +867,16 @@ napi_value PruneDeadDevices(napi_env env, napi_callback_info /*info*/) {
             // 等不到完成包、自己取消 URB 留下的痕迹。设备于是"看起来连上了，
             // 实际不出数据"。
             //
-            // 现在只有占用方已经静默足够久（基本可以认定这个会话已经废了）才探。
-            // 真断掉的连接由 TCP keepalive（约 25 秒）和僵尸会话接管负责收尾，
-            // 健康检查只做最后一道保险。
-            constexpr int kProbeUsingIdleSeconds = 30;
+            // 阈值后来又踩过一次：设成 30 秒时，像加密狗/HID 这类"连着但长时间
+            // 没有 URB"的设备会被当成"静默"，于是每 3 秒被插一发控制传输，持续
+            // 十几二十分钟后客户端那边就开始丢 URB、最后断开——正好对上用户
+            // 反馈的"用久了就越来不稳定"。这类设备的会话其实完全健康，不需要
+            // 健康检查：设备真被拔掉时，它自己的 URB 会返回 NO_DEVICE，会话
+            // 当场就能自愈。
+            //
+            // 所以 using 只在"静默得离谱"时才探（180 秒），把它降级成最后一道
+            // 保险，而不是常规巡检。
+            constexpr int kProbeUsingIdleSeconds = 180;
             for (size_t i = 0; i < using_busids.size(); i++) {
                 const int idle = srv.using_device_idle_seconds(using_busids[i]);
                 if (idle >= 0 && idle < kProbeUsingIdleSeconds) {
@@ -862,7 +925,24 @@ napi_value DumpState(napi_env env, napi_callback_info /*info*/) {
         const auto &available = srv.get_available_devices();
         const auto &using_devices = srv.get_using_devices();
 
+        // 健康监控四个数：运行时长 / 线程数 / fd 数 / RSS。
+        // 判读方式（下次"用久了断"时先看这一行）：
+        //   线程数单调增长 → 会话线程没回收，属于泄漏
+        //   fd 数单调增长   → 每次绑定/解绑漏了 close，几十轮后开不出新设备
+        //   RSS 持续攀升    → 有东西在攒（日志缓冲、transfer 缓冲）
+        //   三者都平稳但连接断 → 链路问题或进程被系统冻结，去看保活日志
+        const int threads = CountProcEntries("task");
+        const int fds = CountProcEntries("fd");
+        const int rss_kb = ReadVmRssKb();
+        const std::string threads_text = threads < 0 ? std::string("?") : std::to_string(threads);
+        const std::string fds_text = fds < 0 ? std::string("?") : std::to_string(fds);
+        const std::string rss_text = rss_kb < 0 ? std::string("?") : std::to_string(rss_kb / 1024) + "MB";
+
         std::string out = "服务运行中 端口=" + std::to_string(g_port)
+                          + " 运行=" + std::to_string(UptimeMinutes()) + "m"
+                          + " 线程=" + threads_text
+                          + " fd=" + fds_text
+                          + " rss=" + rss_text
                           + " 空闲导出=" + std::to_string(available.size())
                           + " 客户端占用=" + std::to_string(using_devices.size());
         for (const auto &dev: available) {

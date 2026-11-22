@@ -271,7 +271,7 @@ index fed7c8a..c403629 100644
      auto dev_addr = libusb_get_device_address(device_for_info);
      // devnum 填端口号（同普通模式，见 bind_host_device 的注释）
 diff --git a/src/Server.cpp b/src/Server.cpp
-index ac8202c..c071598 100644
+index ac8202c..a8e88b6 100644
 --- a/src/Server.cpp
 +++ b/src/Server.cpp
 @@ -12,6 +12,15 @@
@@ -290,20 +290,29 @@ index ac8202c..c071598 100644
  #include "usbipdcpp/utils/utils.h"
  #include "usbipdcpp/protocol.h"
  #include "usbipdcpp/type.h"
-@@ -548,6 +557,40 @@ asio::awaitable<void> usbipdcpp::Server::accept_loop() {
+@@ -548,6 +557,49 @@ asio::awaitable<void> usbipdcpp::Server::accept_loop() {
                  }
              }
  
-+            // [OHOS 移植补丁] TCP 保活。
++            // [OHOS 移植补丁] TCP 保活 —— 只做兜底，**不要**抢在客户端前面判死。
 +            //
-+            // 客户端掉线（WiFi 抖动、PC 休眠、进程被杀、网卡切换）时，本端接收线程
-+            // 挂在同步 read 上永远不会返回，也没有任何写操作去触发错误——设备于是
-+            // 永久滞留在 using_devices 里。表现：客户端刷新设备列表变空，必须重启
-+            // 服务才能恢复。
++            // 客户端掉线（PC 休眠、进程被杀、网卡切换）时，本端接收线程挂在同步
++            // read 上永远不会返回，也没有任何写操作去触发错误——设备于是永久滞留
++            // 在 using_devices 里。表现：客户端刷新设备列表变空，必须重启服务才能
++            // 恢复。所以保活必须有。
 +            //
-+            // 打开保活后，内核在 10 + 5×3 ≈ 25 秒内探测失败并让挂起的读返回错误，
-+            // 会话正常收尾，设备回到可用列表。参数取得比较激进，因为这套部署是
-+            // 同一局域网内的单客户端场景，慢速探测没有收益。
++            // 但阈值不能激进。这里踩过一次坑：原来设的是 10 + 5×3 ≈ 25 秒，
++            // 而 Windows 侧 usbip-win2 的参数是 TCP_KEEPIDLE=30 / INTVL=10 /
++            // CNT=9 ≈ 120 秒。于是链路只要抖动二十几秒（WiFi 省电、漫游、
++            // 路由器 ARP 老化），服务端就先单方面关闭会话，而 PC 那边还以为
++            // 自己连着，继续往死连接上发 URB——用户看到的就是"用着用着突然
++            // 不通了，过一会儿再连也很难连上"，中间有近两分钟的僵尸窗口。
++            //
++            // 正确的关系是：**客户端先发现、先重连，服务端随后跟着收尾**。
++            // PC 侧 120 秒判死后会关掉旧 socket（服务端立刻收到 FIN，干净收尾）
++            // 并发起新连接，新连接由同 IP 接管逻辑在 2 秒内接手。服务端的保活
++            // 只负责清理"PC 直接崩溃、连 FIN 都没发"的情况，所以取 90 + 20×6
++            // ≈ 210 秒，留足客户端先反应的余量。
 +            {
 +                session->socket.set_option(asio::socket_base::keep_alive(true), socket_opt_ec);
 +                if (socket_opt_ec) {
@@ -311,9 +320,9 @@ index ac8202c..c071598 100644
 +                }
 +#if defined(__linux__)
 +                int native_fd = session->socket.native_handle();
-+                int idle_sec = 10;
-+                int intvl_sec = 5;
-+                int probes = 3;
++                int idle_sec = 90;
++                int intvl_sec = 20;
++                int probes = 6;
 +                if (::setsockopt(native_fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_sec, sizeof(idle_sec)) != 0) {
 +                    SPDLOG_WARN("setsockopt(TCP_KEEPIDLE) failed: {}", std::strerror(errno));
 +                }
@@ -331,7 +340,7 @@ index ac8202c..c071598 100644
              // 用 ec 版获取对端地址：客户端可能在 accept 完成后、协程继续执行
              // 之前就已断开（尤其 RST），此时 remote_endpoint() 会抛异常。detached
              // 协程的未捕获异常会导致 std::terminate，因此这里不能抛异常（用 ec
-@@ -560,6 +603,10 @@ asio::awaitable<void> usbipdcpp::Server::accept_loop() {
+@@ -560,6 +612,10 @@ asio::awaitable<void> usbipdcpp::Server::accept_loop() {
              }
              auto remote_endpoint_name = std::format("{}:{}", remote_endpoint.address().to_string(),
                                                      remote_endpoint.port());
@@ -342,7 +351,7 @@ index ac8202c..c071598 100644
  
              // 连接过滤器（来源准入控制）：会话注册前的最后一道关，被拒的连接
              // 直接 continue——session 出作用域即析构（关闭 socket，active_sessions
-@@ -684,19 +731,189 @@ void usbipdcpp::Server::release_device(const std::string &busid) {
+@@ -684,19 +740,197 @@ void usbipdcpp::Server::release_device(const std::string &busid) {
  std::shared_ptr<usbipdcpp::UsbDevice> usbipdcpp::Server::try_moving_device_to_using(const std::string &wanted_busid) {
      std::lock_guard lock(devices_mutex);
      //找能用的设备
@@ -482,12 +491,20 @@ index ac8202c..c071598 100644
 +    // 反过来，来自**不同** IP 的连接绝不能被抢：两台电脑同时在线时那样会互相
 +    // 踢，谁都连不上。所以只认"同一个 IP"这一个信号，而且仍然要求它安静了
 +    // 几秒（避免刚握手就被自己的另一条连接打断）。
++    //
++    // [OHOS 移植补丁] 同 IP 阈值从 10 秒收到 2 秒。
++    //
++    // 局域网里 IP 唯一，"同一 IP 又来一次 IMPORT"没有第二种解释：它就是要
++    // 重连。Windows 侧驱动超时重连时，旧 socket 常常还挂在进程里（既没有 FIN
++    // 也没有新数据），服务端此时如果还要求静默 10 秒，新连接会连续撞
++    // "设备忙"，驱动按指数退避重试，用户看到的就是"断一次之后再也连不上"。
++    // 2 秒只用来排除"同一条连接上两个线程同时提交"这类瞬时重叠。
 +    int threshold = idle_threshold;
 +    const std::string requester_ip = PeerIpOnly(requester_peer);
 +    const std::string owner_ip = PeerIpOnly(owner_peer);
 +    const bool same_client = !requester_ip.empty() && requester_ip == owner_ip;
 +    if (same_client) {
-+        constexpr int kSameClientIdleSeconds = 10;
++        constexpr int kSameClientIdleSeconds = 2;
 +        if (threshold > kSameClientIdleSeconds) {
 +            threshold = kSameClientIdleSeconds;
 +        }
